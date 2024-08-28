@@ -1,0 +1,473 @@
+#!/bin/bash
+# ********************************************************************
+# Ericsson Radio Systems AB                                     SCRIPT
+# ********************************************************************
+#
+#
+# (c) Ericsson Radio Systems AB 2019 - All rights reserved.
+#
+# The copyright to the computer program(s) herein is the property
+# of Ericsson Radio Systems AB, Sweden. The programs may be used 
+# and/or copied only with the written permission from Ericsson Radio 
+# Systems AB or in accordance with the terms and conditions stipulated 
+# in the agreement/contract under which the program(s) have been 
+# supplied.
+#
+# ********************************************************************
+# Name    : continue_eniq_installation.bsh
+# Date    : 28/01/2019
+# Revision: C
+# Purpose : It is responsible for continuing the extraction/configuration
+#           during Ericsson bootstrap phase.
+#
+# Usage   : continue_eniq_installation.bsh
+#
+# ********************************************************************
+#
+# 	Command Section
+#
+# ********************************************************************
+AWK=/usr/bin/awk
+BASENAME=/usr/bin/basename
+CAT=/usr/bin/cat
+CLEAR=/usr/bin/clear
+CP=/usr/bin/cp
+DATE=/usr/bin/date
+DIRNAME=/usr/bin/dirname
+ECHO='/usr/bin/echo -e'
+EGREP=/usr/bin/egrep
+EXPR=/usr/bin/expr
+GREP=/usr/bin/grep
+GTAR=/usr/bin/gtar
+ZCAT=/usr/bin/zcat
+HOSTNAME=/usr/bin/hostname
+ID=/usr/bin/id
+MKDIR=/usr/bin/mkdir
+SED=/usr/bin/sed
+STTY=/usr/bin/stty
+TEE=/usr/bin/tee
+TOUCH=/usr/bin/touch
+TTY=/usr/bin/tty
+
+# ********************************************************************
+#
+#       Configuration Section
+#
+# ********************************************************************
+# DVD LABEL or Jumpstart Directory where all ENIQ SW will reside
+ENIQ_BASE_SW=eniq_base_sw
+
+# Directory on the root filesystem
+ENIQ_ROOT_DIR=/eniq
+
+LOGDIR=${ERIC_ROOT_DIR}/installation/log
+
+# This is the name of the core installation SW bundle that resides in the
+# $ENIQ_BASE_SW directory
+ENIQ_CORE_INST_SW_BUNDLE=install/eniq_core_inst_sw_bundle.tar.gz
+
+# The root directory of the SW Bundle. The bundle will be untarred
+# from this directory
+ENIQ_CORE_INST_SW_BUNDLE_ROOT_DIR=${ENIQ_ROOT_DIR}/installation
+
+# 
+ENIQ_CONF_DIR=${ENIQ_CORE_INST_SW_BUNDLE_ROOT_DIR}/config
+
+
+# Cmd to exec a shell and drop user to it in case of an error
+EXEC_SHELL_CMD="exec /bin/bash -o emacs"
+
+# Build an array to store the stage names
+BOOTSTRAP_CONTINUE_STAGES=( unpack_inst_eniq_sw
+run_eniq_core_inst_phase
+end_script )
+
+
+# ********************************************************************
+#
+#       Pre-execution Operations
+#
+# ********************************************************************
+
+
+# ********************************************************************
+#
+# 	functions
+#
+# ********************************************************************
+### Function: abort_script ###
+#
+#   This will is called if the script is aborted thru an error
+#   error signal sent by the kernel such as CTRL-C or if a serious
+#   error is encountered during runtime
+#
+# Arguments:
+#       $1 - Error message from part of program (Not always used)
+# Return Values:
+#       none
+abort_script()
+{
+if [ "$1" ]; then
+    _err_msg_=$1
+else
+    _err_msg_="Script aborted.......\n"    
+fi
+if [ "${LOGFILE}" ]; then
+    $ECHO "\n${_err_msg_}\n"|$TEE -a ${LOGFILE}
+else
+    $ECHO "\n${_err_msg_}\n"
+fi
+cd $SCRIPTHOME
+
+if [ "$2" ]; then
+    ${2} >> /dev/null 2>&1
+else
+   exit 1
+fi
+}
+
+### Function: check_id ###
+#
+#   Check that the effective id of the user is correct
+#   If not print error msg and exit.
+#
+# Arguments:
+#       $1 : User ID name
+# Return Values:
+#       none
+check_id()
+{
+_check_id_=`$ID  | $AWK -F\( '{print $2}' | $AWK -F\) '{print $1}'`
+if [ "$_check_id_" != "$1" ]; then
+    _err_msg_="You must be $1 to execute this script."
+    abort_script "${_err_msg_}"
+fi
+}
+
+### Function: end_script ###
+#
+# Final stage. Clean up
+#
+# Arguments:
+#	none
+# Return Values:
+#	none
+end_script()
+{
+
+return 0
+
+}
+
+### Function: get_absolute_path ###
+#
+# Determine absolute path to software
+#
+# Arguments:
+#	none
+# Return Values:
+#	none
+get_absolute_path() 
+{
+_dir_=`$DIRNAME $0`
+SCRIPTHOME=`cd $_dir_ 2>/dev/null && pwd || $ECHO $_dir_`
+}
+
+### Function: get_array_element ###
+#
+# Get the current array element number
+#
+# Arguments:
+#   none
+# Return Values:
+#   none
+get_array_element()
+{	
+_array_length_=${#BOOTSTRAP_CONTINUE_STAGES[*]}
+_array_length_=`${EXPR} ${_array_length_} - 1`
+
+for (( _elem_=0; _elem_<=${_array_length_}; _elem_++ )); do
+    $ECHO ${BOOTSTRAP_CONTINUE_STAGES[${_elem_}]} | $GREP -w ${NEXT_STAGE} >> /dev/null 2>&1
+    if [ $? -eq 0 ]; then
+        ARRAY_ELEM=${_elem_}
+        break
+    fi
+done
+}
+
+### Function: get_next_stage ###
+#
+# Get the stage to be run
+#
+# Arguments:
+#	none
+# Return Values:
+#	none
+get_next_stage()
+{
+ARRAY_ELEM=0
+
+if [ -s ${STAGEFILE} ]; then
+    NEXT_STAGE=`$CAT ${STAGEFILE}|$EGREP -v '^[ 	]*#' | $SED -e 's| ||g'`
+    if [ ! "$NEXT_STAGE" ]; then
+        _err_msg_="ERROR: Failed to read stage from ${STAGEFILE}, exiting."
+        abort_script "${_err_msg_}" "${EXEC_SHELL_CMD}"
+    fi
+    if [ "$NEXT_STAGE" == "end_script" ]; then
+        return 0
+    fi
+    # Get the element number so we can move along the array
+    get_array_element
+else
+    $MKDIR -p `$DIRNAME ${STAGEFILE}`
+    if [ $? -ne 0 ]; then
+        _err_msg_="Failed to create directory `$DIRNAME ${STAGEFILE}`, exiting."
+        abort_script "${_err_msg_}" "${EXEC_SHELL_CMD}"
+    fi
+    NEXT_STAGE=${BOOTSTRAP_CONTINUE_STAGES[${ARRAY_ELEM}]}
+fi
+}
+
+### Function: insert_header_footer ###
+#
+#   Insert a stage header/footer message
+#
+# Arguments:
+#	$1 : head/foot
+#	$2 : Message
+#	$3 : Logfile
+# Return Values:
+#	none
+insert_header_footer()
+{
+if [ $# -ne 3 ]; then
+    _err_msg_="3 Parameters must be passed to header/footer function"
+    abort_script "${_err_msg_}" "${EXEC_SHELL_CMD}"
+fi	
+
+if [ "$1" != "head" -a "$1" != "foot" ]; then
+    _err_msg_="Only Param of head/foot is allowed...exiting!"
+    abort_script "${_err_msg_}" "${EXEC_SHELL_CMD}"
+fi	
+_type_=$1
+
+_msg_=$2
+
+_logfile_=$3
+$MKDIR -p `$DIRNAME ${_logfile_}`
+if [ $? -ne 0 ]; then
+    _err_msg_="Could not create directory `$DIRNAME ${_logfile_}`"
+    abort_script "${_err_msg_}" "${EXEC_SHELL_CMD}"
+fi	
+
+$TOUCH -a ${_logfile_}
+if [ $? -ne 0 ]; then
+    _err_msg_="Could not write to file ${_logfile_}"
+    abort_script "${_err_msg_}" "${EXEC_SHELL_CMD}"
+fi	
+
+_time_=`$DATE '+%Y-%b-%d_%H.%M.%S'`
+if [ "$_type_" == "head" ]; then
+    $ECHO "=====================================================" >> ${_logfile_}
+    $ECHO "=====================================================\n" >> ${_logfile_}
+fi
+$ECHO "$_time_ : $_msg_"|$TEE -a ${_logfile_}
+if [ "$_type_" == "foot" ]; then
+    $ECHO "=====================================================" >> ${_logfile_}
+    $ECHO "=====================================================\n" >> ${_logfile_}
+fi
+}
+
+### Function: run_eniq_core_inst_phase ###
+#
+# Unpack/Install ENIQ core installation software
+#
+# Arguments:
+#	none
+# Return Values:
+#	none
+run_eniq_core_inst_phase()
+{
+
+INST_TYPE=`$CAT ${ENIQ_CONF_DIR}/inst_type`
+
+# This is the name of the core installation SW controls the rest of the ENIQ installation
+
+ENIQ_CORE_INST_SCRIPT=${ENIQ_CORE_INST_SW_BUNDLE_ROOT_DIR}/core_install/bin/eniq_core_install.bsh
+
+if [ ! -x ${ENIQ_CORE_INST_SCRIPT} ]; then
+    _err_msg_="Script ${ENIQ_CORE_INST_SCRIPT}\nmissing or not executable"
+    abort_script "${_err_msg_}" "${EXEC_SHELL_CMD}"
+fi	
+
+$TTY |$GREP -w console >> /dev/null 2>&1
+if [ $? -eq 0 ]; then
+    echo "Using console based installation environment..."
+    ${ENIQ_CORE_INST_SCRIPT} >/dev/console </dev/console 2>&1
+else
+    echo "Using non-console based installation environment..."
+    ${ENIQ_CORE_INST_SCRIPT}
+fi
+
+if [ $? -ne 0 ]; then
+    abort_script "${_err_msg_}" "${EXEC_SHELL_CMD}"
+fi	
+
+local _next_stage_=`$EXPR ${ARRAY_ELEM} + 1`
+set_next_stage ${_next_stage_}
+}
+
+### Function: set_next_stage ###
+#
+# Set up the stage to be run
+#
+# Arguments:
+#	$1 : Stage to be set to. Either numeric value or 'done'
+# Return Values:
+#	none
+set_next_stage()
+{
+_stage_time_=`$DATE '+%Y-%b-%d_%H.%M.%S'`
+$ECHO "# Setting new stage at $_stage_time_" > ${STAGEFILE} | $TEE -a ${LOGFILE}
+$ECHO "${BOOTSTRAP_CONTINUE_STAGES[$1]} " >> ${STAGEFILE} | $TEE -a ${LOGFILE}
+}
+
+### Function: unpack_inst_eniq_sw ###
+#
+# Unpack/Install ENIQ core installation software
+#
+# Arguments:
+#	none
+# Return Values:
+#	none
+unpack_inst_eniq_sw()
+{
+_core_inst_sw_bundle_=$SW_DIR/${ENIQ_CORE_INST_SW_BUNDLE}
+
+# Check that the bundle exists
+if [ ! -s ${_core_inst_sw_bundle_} ]; then
+     _err_msg_="Failed to find SW bundle\n${_core_inst_sw_bundle_}"
+    abort_script "${_err_msg_}" "${EXEC_SHELL_CMD}"
+fi
+
+$MKDIR -p $ENIQ_CORE_INST_SW_BUNDLE_ROOT_DIR
+if [ $? -ne 0 ]; then
+    _err_msg_="Could not create directory $ENIQ_CORE_INST_SW_BUNDLE_ROOT_DIR"
+    abort_script "${_err_msg_}" "${EXEC_SHELL_CMD}"
+fi	
+
+cd $ENIQ_CORE_INST_SW_BUNDLE_ROOT_DIR
+
+$ZCAT ${_core_inst_sw_bundle_} |$GTAR -xf -
+if [ $? -ne 0 ]; then
+    _err_msg_="Failed to install ENIQ Core Install SW...exiting!"
+    abort_script "${_err_msg_}" "${EXEC_SHELL_CMD}"
+else
+    insert_header_footer foot "Successfully installed ENIQ Core Install SW." ${LOGFILE}
+fi
+
+local _next_stage_=`$EXPR ${ARRAY_ELEM} + 1`
+set_next_stage ${_next_stage_}
+}
+
+### Function: usage_msg ###
+#
+#   Print out the usage message
+#
+# Arguments:
+#   none
+# Return Values:
+#   none
+usage_msg()
+{
+$CLEAR
+$ECHO "
+Usage: `$BASENAME $0` -b <full path to bootstrap dir> -S <full path to sw dir> [-s <stage> ]
+
+options:
+
+-b  : Parameter specifying the full path to where the installation
+      bootstrap directory
+
+-S  : Parameter specifying the full path to the directory
+      containing the ENIQ BASE SW directory structure.
+
+NOTE: This script is not designed to be run outside of the installation
+      framework without due care being taken.
+"
+}
+
+# ********************************************************************
+#
+# 	Main body of program
+#
+# ********************************************************************
+#
+#Command for interactive terminal console.
+${STTY} sane
+export TERM=linux
+
+# Determine absolute path to software
+get_absolute_path
+
+# Check that the effective id of the user is root
+check_id root
+
+while getopts ":b:S:" arg; do
+  case $arg in
+    b) ERIC_BOOTSTRAP_DIR="$OPTARG"
+       ;;
+    S) SW_DIR="$OPTARG"
+       ;;
+   \?) usage_msg
+       abort_script "${_err_msg_}" 
+       ;;
+  esac
+done
+shift `expr $OPTIND - 1`
+
+if [ ! "${SW_DIR}" -o ! "${ERIC_BOOTSTRAP_DIR}" ]; then
+    usage_msg
+    exit 1
+fi	
+
+if [  ! -d "${ERIC_BOOTSTRAP_DIR}" ]; then
+    _err_msg_="${ERIC_BOOTSTRAP_DIR} does not exist"
+    abort_script "${_err_msg_}" 
+fi	
+
+# Set up logfile 
+RUN_TIME=`$DATE '+%Y-%b-%d_%H.%M.%S'`
+$MKDIR -p ${LOGDIR}
+LOGFILE="${LOGDIR}/`${HOSTNAME}`_eric_bootstrap_continue_log_${RUN_TIME}"
+$TOUCH ${LOGFILE}
+
+# File to hold stage information
+$MKDIR -p ${ERIC_BOOTSTRAP_DIR}/etc
+STAGEFILE=${ERIC_BOOTSTRAP_DIR}/etc/bootstrap_continue_stage
+
+# Get the next stage
+get_next_stage
+
+while :; do
+    _nxt_stage_="${NEXT_STAGE}"
+    $_nxt_stage_
+    if [ $? -ne 0 ]; then
+        _err_msg_="Error in Stage ${NEXT_STAGE}"
+        abort_script "${_err_msg_}" "${EXEC_SHELL_CMD}"
+    fi
+
+    # Exit if the user specified to run a specific stage only
+    if [ "$USER_STAGE" ]; then
+        break
+    fi
+
+    # If we read done from the stagefile
+    if [ "$NEXT_STAGE" == "end_script" ]; then
+        break
+    fi
+
+    get_next_stage
+done
+
+exit 0

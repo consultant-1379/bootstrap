@@ -1,0 +1,2238 @@
+#!/bin/bash
+# ********************************************************************
+# Ericsson Radio Systems AB      SCRIPT                                    
+# ********************************************************************
+#
+#
+# (c) Ericsson Radio Systems AB 2022 - All rights reserved.
+#
+# The copyright to the computer program(s) herein is the property
+# of Ericsson Radio Systems AB, Sweden. The programs may be used
+# and/or copied only with the written permission from Ericsson Radio
+# Systems AB or in accordance with the terms and conditions stipulated
+# in the agreement/contract under which the program(s) have been
+# supplied.
+#
+# ********************************************************************
+#
+# Name    : continue_eniq_replacement.bsh
+# Date    : 25/11/2022
+# Revision: \main\13
+# Purpose : This script will be called when Blade Replacement is       
+#            continued after OS (RHEL) installation is completed.
+#           
+# Usage   : continue_eniq_replacement.bsh
+#
+# ********************************************************************
+#
+#   Command Section
+#
+# ********************************************************************
+AWK=/usr/bin/awk
+BASH=/usr/bin/bash
+CAT=/usr/bin/cat
+CLEAR=/usr/bin/clear
+CUT=/usr/bin/cut
+CP=/usr/bin/cp
+DATE=/usr/bin/date
+DF=/usr/bin/df
+DIRNAME=/usr/bin/dirname
+DRACUT=/usr/sbin/dracut
+ECHO='/usr/bin/echo -e'
+EGREP=/usr/bin/egrep
+EXPECT=/usr/bin/expect
+EXPR=/usr/bin/expr
+GREP=/usr/bin/grep
+MYHOSTNAME=/usr/bin/hostname
+ID=/usr/bin/id
+INIT=/usr/sbin/init
+IP=/usr/sbin/ip
+IFCONFIG=/usr/sbin/ifconfig
+LS=/usr/bin/ls
+MKDIR=/usr/bin/mkdir
+MOUNT=/usr/bin/mount
+MV=/usr/bin/mv
+NMCLI=/usr/bin/nmcli
+OPENSSL=/usr/bin/openssl
+PING=/usr/bin/ping
+PRINTF=/usr/bin/printf
+RM=/usr/bin/rm
+RPM=/usr/bin/rpm
+SED=/usr/bin/sed
+SLEEP=/usr/bin/sleep
+SYSTEMCTL=/usr/bin/systemctl
+SORT=/usr/bin/sort
+STTY=/usr/bin/stty
+TEE=/usr/bin/tee
+TOUCH=/usr/bin/touch
+TR=/usr/bin/tr
+UMOUNT=/usr/bin/umount
+VGCHANGE=/usr/sbin/vgchange
+VGIMPORT=/usr/sbin/vgimport
+VGS=/usr/sbin/vgs
+WC=/usr/bin/wc
+
+# ********************************************************************
+#
+#       Configuration Section
+#
+# ********************************************************************
+# Cmd to exec a shell and drop user to it in case of an error
+EXEC_SHELL_CMD="exec /bin/bash -o emacs"
+
+# Default user
+DEFAULT_USER=root
+
+#VG Information
+ROOT_POOL="vg_root"
+
+# Host name
+HNAME=`$MYHOSTNAME`
+
+# Replacement backup server user
+REP_SCP_USER=support
+
+# Replacement conf files
+REP_SW_DIR=/var/tmp/replacement_sw
+REPLACEMENT_CONF=${REP_SW_DIR}/replacement_${HNAME}.conf
+CONF=/eniq/installation/config/
+
+# Build an array to store the stage names
+LIN_REP_STAGES=( install_emc_pkg
+configure_stor_api
+import_vg
+start_replacement 
+cleanup
+)
+
+
+
+# *********************
+#
+# Functions
+#
+# *********************
+
+
+### Function: ### Function: abort_script ###
+#
+#   This will be called if the script is aborted through an error
+#   signal sent by the kernel if a serious
+#   error encountered during runtime
+#
+# Arguments:
+#       $1 - Error message from part of program (Not always used)
+#       $2 - EXEC_SHELL_CMD
+# Return Values:
+#       none
+abort_script()
+{
+if [ "$1" ]; then
+    _err_msg_="ERROR: $1"
+else
+    _err_msg_="ERROR: Script aborted......."
+fi
+if [ "${LOGFILE}" ]; then
+    $ECHO "$_err_msg_" |$TEE -a ${LOGFILE}
+else
+    $ECHO "$_err_msg_" 
+fi
+cd $SCRIPTHOME
+
+if [ "$2" ]; then
+    ${2} 
+else
+   exit 1
+fi
+}
+
+
+### Function: check_id #######################################
+#
+#   Check that the effective id of the user is correct
+#   If not print error msg and exit.
+##############################################################
+check_id()
+{
+_check_id_=`$ID  | $AWK -F\( '{print $2}' | $AWK -F\) '{print $1}'`
+if [ "$_check_id_" != "$1" ]; then
+    _err_msg_="You must be $1 to execute this script."
+    abort_script "${_err_msg_}" "${EXEC_SHELL_CMD}"
+fi
+}
+
+
+### Function: cleanup ###
+#
+# Final stage. Clean up
+#
+# Arguments:
+#       none
+# Return Values:
+#       none
+cleanup()
+{
+# Remove the TEMP directory
+$RM -rf ${TEM_DIR}
+return 0
+}
+
+
+### Function: configure_stor_api ###
+#
+#   Configure Storage API
+#
+# Arguments:
+#       none
+# Return Values:
+#       none
+configure_stor_api()
+{
+insert_header_footer head "Entering Replacement Stage - ${NEXT_STAGE}" ${LOGFILE}
+
+# installing EricStorage API package
+install_stor_pkg
+if [ $? -ne 0 ];then
+    _err_msg_="Failed to install Storage package."
+    abort_script "${_err_msg_}" "${EXEC_SHELL_CMD}"
+fi
+
+# Check if storage is configured
+log "Checking if storage is already configured."
+if [ "${SAN_DEVICE}" == "vnx" ]; then
+    _storage_conf_file_=${ERICSSON_STOR_DIR}/san/plugins/${SAN_DEVICE}/etc/clariion.conf
+else
+    _storage_conf_file_=${ERICSSON_STOR_DIR}/san/plugins/${SAN_DEVICE}/etc/unity.conf
+fi
+
+if [ -s "${_storage_conf_file_}" ];then
+    logit "Storage is configured."
+    set_next_stage `$EXPR ${ARRAY_ELEM}+1`
+    return 0
+else    
+    # Read location of storage API command
+    _stor_api_cmd_=${ERICSSON_STOR_DIR}/san/bin/blkcli
+    if [ ! -x ${_stor_api_cmd_} ]; then
+        _err_msg_="${_stor_api_cmd_} is not found or is not executable"
+        abort_script "${_err_msg_}" "${EXEC_SHELL_CMD}"
+    fi
+
+    # Get storage data from replacement conf file
+    _no_of_san_=`$CAT ${REPLACEMENT_CONF} | $GREP "^STORAGE_NAME_" | $WC -l`
+    _stor_det_file_=${TEM_DIR}/store_api_det_file
+    $RM -rf ${_stor_det_file_}
+
+    for (( _count_=1; $_count_<=$_no_of_san_; _count_++ ));do
+        logit "INFO: Configuring Storage device ${_count_}"
+        # Get required SAN details from replacement conf file
+        _stor_name_=`read_value STORAGE_NAME_${_count_} ${REPLACEMENT_CONF}` || abort_script "${_stor_name_}" "${EXEC_SHELL_CMD}"
+        _stor_admin_=`read_value STORAGE_ADMIN_${_count_} ${REPLACEMENT_CONF}` || abort_script "${_stor_admin_}" "${EXEC_SHELL_CMD}"
+         _stor_pass_=`$CAT ${REPLACEMENT_CONF} | $GREP "^STORAGE_PASS_${_count_}" |$CUT --complement -d "=" -f 1` || abort_script "${_stor_pass_}""${EXEC_SHELL_CMD}"
+        _stor_pass_=`$ECHO ${_stor_pass_} | $OPENSSL enc -base64 -d`
+        _stor_spa_=`read_value STORAGE_SPA_${_count_} ${REPLACEMENT_CONF}` || abort_script "${_stor_spa_}" "${EXEC_SHELL_CMD}"
+        _stor_group_=`read_value STORAGE_GROUP_${_count_} ${REPLACEMENT_CONF}` || abort_script "${_stor_group_}" "${EXEC_SHELL_CMD}"
+        if [ "${SAN_DEVICE}" == "vnx" ]; then
+            _stor_spb_=`read_value STORAGE_SPB_${_count_} ${REPLACEMENT_CONF}` || abort_script "${_stor_spb_}" "${EXEC_SHELL_CMD}"
+        else
+            _stor_disks_=`read_value STORAGE_DISKS_${_count_} ${REPLACEMENT_CONF}` || abort_script "${_stor_disks_}" "${EXEC_SHELL_CMD}"
+        fi
+        if [ "${SAN_DEVICE}" == "unityXT" ]; then
+            SAN_DEVICE=unity
+        fi
+        if [ "${SAN_DEVICE}" == "vnx" ]; then
+            if [ ! -s ${_stor_det_file_} ]; then
+                $ECHO "agentip=${HOST_AGENT_IP}" > ${_stor_det_file_}
+            fi
+            $ECHO "${SAN_DEVICE}=${_stor_name_}:${_stor_admin_}:${_stor_pass_}:${_stor_spa_}:${_stor_spb_}:${_stor_group_}" >> ${_stor_det_file_}
+        else
+            $ECHO "${SAN_DEVICE}=${_stor_admin_}:${_stor_pass_}:${_stor_spa_}:${_stor_disks_}:${_stor_group_}" >> ${_stor_det_file_}
+        fi    
+    done
+
+    # Check stor api file
+        if [ ! -s ${_stor_det_file_} ];then
+           _err_msg_="Unable to store SAN data in ${_stor_det_file_} file."
+           abort_script "${_err_msg_}" "${EXEC_SHELL_CMD}"
+        fi
+    # Register the server with the SAN and see the Luns
+    logit "Executing command: ${_stor_api_cmd_} --action configure --plugin ${SAN_DEVICE} --config ${_stor_det_file_}"
+    ${_stor_api_cmd_} --action configure -plugin ${SAN_DEVICE} --config ${_stor_det_file_}
+    if [ $? -ne 0 ]; then
+        _error_msg_="Unable to configure SAN."
+        # Uninstall ERICstorapi
+        logit "Removing current instance of ERICstorapi package"
+        $RPM -evh ${_stor_api_pkg_}
+        if [ $? -ne 0 ]; then
+            _err_msg_="Failed to remove ERICstorapi pkg"
+            abort_script "${_err_msg_}" "${EXEC_SHELL_CMD}"
+        fi
+        $RM -rf ${ERICSSON_STOR_DIR}
+        abort_script "${_error_msg_}" "${EXEC_SHELL_CMD}" 
+    fi
+    
+    logit "INFO: Successfully configured Storage API."
+    SAN_DEVICE=`$CAT ${REP_DIR}/storage_type |$CUT -d "=" -f 2`
+    ##Enabling mpath module
+    if [ "${SAN_DEVICE}" == "unityXT" ]; then
+        enable_mpath_module
+        logit -s  "Successfully enabled the mpath values"
+    fi
+    logit "Creating reconfiguration file"
+    ## Adding multipath module to initramfs before reboot
+    $DRACUT --force --add multipath --include /etc/multipath
+    if [ $? -ne 0 ]; then
+         _err_msg_="Failed to add multipath module to initramfs using DRACUT"
+         abort_script "${_err_msg_}" "${EXEC_SHELL_CMD}"
+    fi
+
+    logit "WARNING: Server will now be rebooted...!!"
+
+    insert_header_footer foot "Successfully completed Replacement Stage - ${NEXT_STAGE}" ${LOGFILE}
+    set_next_stage `$EXPR ${ARRAY_ELEM} + 1`
+    ## Rebooting the server for configuring san storage api
+    $INIT 6
+fi
+
+}
+
+### Function: configure_storage_vlan_unityXT ###
+#
+# To configure the storage VLAN interface
+#
+# Arguments:none
+#       
+# Return Values:
+#         none
+configure_storage_vlan_unityXT()
+{
+
+# Network service name
+_network_svc_="network.service"
+
+# Take the inputs from USER_CONF if present
+if [ -s ${USER_CONF} ]; then
+    _temp_user_conf_=${USER_CONF}
+fi
+
+#
+_primary_intf_=`$NMCLI device | $GREP -w "connected" |$SORT -u |$AWK '{print $1}'`
+if [ ! "${_primary_intf_}" ]; then
+     _err_msg_="Could not get interface plumbed during OS installation"
+     abort_script "${_err_msg_}" "${EXEC_SHELL_CMD}"
+fi
+
+#Getting Storage VLAN Details
+_stor_ip_=`read_value STOR_VLAN_IP ${_temp_user_conf_}` || abort_script "${_stor_ip_}" "${EXEC_SHELL_CMD}"
+_stor_subnet_=`read_value STOR_VLAN_SUBNET ${_temp_user_conf_}` || abort_script "${_stor_subnet_}" "${EXEC_SHELL_CMD}"
+_stor_gateway_=`read_value STOR_VLAN_GATEWAY ${_temp_user_conf_}` || abort_script "${_stor_gateway_}" "${EXEC_SHELL_CMD}"
+_stor_vlan_id_=`read_value STOR_VLAN_Group_ID ${_temp_user_conf_}` || abort_script "${_stor_vlan_id_}" "${EXEC_SHELL_CMD}"
+_vlan_group_="Storage Group"
+
+
+_bond_tag_=${_primary_intf_}.${_stor_vlan_id_}
+if [ ! "${_bond_tag_}" ]; then
+    _err_msg_="Failed to set VLAN tag file name."
+    abort_script "${_err_msg_}" "${EXEC_SHELL_CMD}"
+fi
+
+$TOUCH /var/tmp/intf_info.txt
+if [ $? -ne 0 ]; then
+    _err_msg_="Could not create file"
+    abort_script "$_err_msg_"
+fi
+
+$ECHO "${_bond_tag_}" > /var/tmp/intf_info.txt
+
+#Putting Handling for rerun case
+$NMCLI con show --active | $GREP -w ${_bond_tag_} >>/dev/null 2>&1
+if [ $? -eq 0 ]; then
+    logit "Storage VLAN interface ${_primary_intf_} is already created."
+    return 0
+fi
+
+#configure VLAN tag file
+
+    $NMCLI con add type vlan \
+    con-name ${_bond_tag_} \
+    dev ${_primary_intf_} \
+    id ${_stor_vlan_id_} \
+    ip4 ${_stor_ip_}/${_stor_subnet_} \
+    ipv4.never-default true \
+        gw4 ${_stor_gateway_} | $TEE -a ${_logfile_}
+
+if [ $? -ne 0 ]; then
+    _err_msg_="Could not Create VLAN tag file for ${_vlan_group_}"
+    abort_script "${_err_msg_}" "${EXEC_SHELL_CMD}"
+else
+    logit "Successfully created VLAN tag file ifcfg-${_bond_tag_} for ${_vlan_group_} \n"
+fi
+
+
+#bring the connection up
+$NMCLI connection up ${_bond_tag_} | $TEE -a ${_logfile_}
+if [ $? -ne 0 ]; then
+    _err_msg_="Unable to make up ${_bond_tag_}"
+    abort_script "${_err_msg_}" "${EXEC_SHELL_CMD}"
+else
+    logit "Successfully activated VLAN tag ifcfg-${_bond_tag_} for ${_vlan_group_} \n\n"
+fi
+
+# Check if the interface is up
+$NMCLI con show --active | $GREP -w ${_bond_tag_} >>/dev/null 2>&1
+if [ $? -ne 0 ]; then
+    logit "Restarting the network service"
+    $SYSTEMCTL restart ${_network_svc_} 
+    _ns_state_=`$SYSTEMCTL show ${_network_svc_} -p ActiveState | $CUT -f2 -d=`
+    if [ "${_ns_state_}" != "active" ]; then
+        _err_msg_="Failed to start ${_network_svc_}"
+        abort_script "${_err_msg_}" "${EXEC_SHELL_CMD}"
+    fi
+    logit "${_network_svc_} successfully restarted"
+    $NMCLI con show --active | $GREP -w ${_bond_tag_} >>/dev/null 2>&1
+    if [ $? -ne 0 ]; then
+        _err_msg_="Could not bring storage interface ${_stor_intf_} up."
+        abort_script "${_err_msg_}" "${EXEC_SHELL_CMD}"
+    fi
+fi
+
+logit "Successfully configured the storage VLAN interface ${_primary_intf_}"
+
+}
+
+
+### Function: configure_storage_vlan ###
+#
+# To configure the storage VLAN interface
+#
+# Arguments:none
+#       
+# Return Values:
+#         none
+configure_storage_vlan()
+{
+
+# Network service name
+_network_svc_="network.service"
+
+# Take the inputs from USER_CONF if present
+if [ -s ${USER_CONF} ]; then
+    _temp_user_conf_=${USER_CONF}
+fi
+
+_stor_intf_=`read_value STOR_VLAN_INTF ${_temp_user_conf_} | $AWK -F " " '{print $1}'` || abort_script "${_stor_intf_}" "${EXEC_SHELL_CMD}"
+_stor_ip_=`read_value STOR_VLAN_IP ${_temp_user_conf_}` || abort_script "${_stor_ip_}" "${EXEC_SHELL_CMD}"
+_stor_subnet_=`read_value STOR_VLAN_SUBNET ${_temp_user_conf_}` || abort_script "${_stor_subnet_}" "${EXEC_SHELL_CMD}"
+_stor_gateway_=`read_value STOR_VLAN_GATEWAY ${_temp_user_conf_}` || abort_script "${_stor_gateway_}" "${EXEC_SHELL_CMD}"
+
+# Check if the IP already assigned to any interface 
+_existing_intf_=`$IP addr show | $GREP "${_stor_ip_}/${_stor_subnet_}" | $AWK '{print $NF}'`
+if [ "${_existing_intf_}" ]; then
+    # Return from here as the user selected interface and ip is configured
+    if [ "${_existing_intf_}" == "${_stor_intf_}" ]; then
+        logit "Storage VLAN interface ${_stor_intf_} is already created."
+        return 0
+    fi
+
+    # Recreate the interface to remove the IP if it is not user selected interface
+    logit "Un-assigning the IP address ${_stor_ip_}/${_stor_subnet_} from ${_stor_intf_}"
+    $NMCLI con del ${_existing_intf_} >> /dev/null 2>&1
+    if [ $? -ne 0 ]; then
+        _err_msg_="Could not delete the existing interface ${_existing_intf_}"
+        abort_script "${_err_msg_}" "${EXEC_SHELL_CMD}"
+    fi
+    logit -q "Successfully removed the existing interface ${_existing_intf_}"
+
+    logit -q "Recreating the removed interface ${_existing_intf_}"
+    $NMCLI con add type ethernet \
+           ifname ${_existing_intf_} \
+           con-name ${_existing_intf_} \
+           connection.autoconnect no >> /dev/null 2>&1
+    if [ $? -ne 0 ]; then
+        _err_msg_="Could not re-create the interface ${_existing_intf_}"
+        abort_script "${_err_msg_}" "${EXEC_SHELL_CMD}"
+    fi
+    logit "Successfully unassigned the IP address ${_stor_ip_}/${_stor_subnet_} from ${_stor_intf_}"
+fi
+
+# Create the storage interface
+$NMCLI con mod ${_stor_intf_} \
+       ipv4.method manual \
+       ipv4.addr ${_stor_ip_}/${_stor_subnet_} \
+       ipv4.gateway ${_stor_gateway_} \
+       connection.autoconnect yes >> /dev/null 2>&1
+if [ $? -ne 0 ]; then
+    _err_msg_="Could not configure the storage VLAN interface ${_stor_intf_}"
+    abort_script "${_err_msg_}" "${EXEC_SHELL_CMD}"
+fi
+
+logit "Created the storage VLAN interface ${_stor_intf_} successfully"
+
+# Check if the interface is up
+$NMCLI con show --active | $GREP -w ${_stor_intf_} >>/dev/null 2>&1
+if [ $? -ne 0 ]; then
+    logit "Restarting the network service"
+    $SYSTEMCTL restart ${_network_svc_} 
+    _ns_state_=`$SYSTEMCTL show ${_network_svc_} -p ActiveState | $CUT -f2 -d=`
+    if [ "${_ns_state_}" != "active" ]; then
+        _err_msg_="Failed to start ${_network_svc_}"
+        abort_script "${_err_msg_}" "${EXEC_SHELL_CMD}"
+    fi
+    logit "${_network_svc_} successfully restarted"
+    $NMCLI con show --active | $GREP -w ${_stor_intf_} >>/dev/null 2>&1
+    if [ $? -ne 0 ]; then
+        _err_msg_="Could not bring storage interface ${_stor_intf_} up."
+        abort_script "${_err_msg_}" "${EXEC_SHELL_CMD}"
+    fi
+fi
+
+logit "Successfully configured the storage VLAN interface ${_stor_intf_}"
+
+}
+### Function: enable_mpath_module ###
+#
+# enable_mpath_module
+#
+# Arguments:
+# Return Values:
+#    none
+enable_mpath_module()
+{
+if [ ! -f /etc/multipath.conf ]; then
+
+        $CP /usr/share/doc/device-mapper-multipath-0.4.9/multipath.conf /etc/multipath.conf
+            if [ $? -ne 0 ]; then
+                _err_msg_="Failed to copy multipath.conf file"
+                abort_script "${_err_msg_}" "${EXEC_SHELL_CMD}"
+            fi
+        $SYSTEMCTL start multipathd
+            if [ $? -ne 0 ]; then
+                _err_msg_="Failed to start multipathd Service"
+                abort_script "${_err_msg_}" "${EXEC_SHELL_CMD}"
+            fi
+
+        $SYSTEMCTL enable multipathd
+            if [ $? -ne 0 ]; then
+                _err_msg_="Failed to enable multipathd Service"
+                abort_script "${_err_msg_}" "${EXEC_SHELL_CMD}"
+            fi
+
+        $ECHO "devices {" >> /etc/multipath.conf
+
+        $ECHO "        device {" >> /etc/multipath.conf
+
+        $ECHO "                vendor \"DGC\"" >> /etc/multipath.conf
+
+        $ECHO "                product \".*\"" >> /etc/multipath.conf
+
+        $ECHO "                product_blacklist \"LUNZ\"" >> /etc/multipath.conf
+
+        $ECHO "                path_grouping_policy \"group_by_prio\"" >> /etc/multipath.conf
+
+        $ECHO "                path_checker \"emc_clariion\"" >> /etc/multipath.conf
+
+        $ECHO "                features \"1 queue_if_no_path\"" >> /etc/multipath.conf
+
+        $ECHO "                hardware_handler \"1 alua\"" >> /etc/multipath.conf
+
+        $ECHO "                prio \"alua\"" >> /etc/multipath.conf
+
+        $ECHO "                prio_args \"exclusive_pref_bit\"" >> /etc/multipath.conf
+
+        $ECHO "                failback immediate" >> /etc/multipath.conf
+
+        $ECHO "                rr_weight \"uniform\"" >> /etc/multipath.conf
+
+        $ECHO "                no_path_retry 60" >> /etc/multipath.conf
+
+        $ECHO "                retain_attached_hw_handler yes" >> /etc/multipath.conf
+
+        $ECHO "                detect_prio yes"  >> /etc/multipath.conf
+
+        $ECHO "                detect_path_checker no" >> /etc/multipath.conf
+
+        $ECHO "        }" >> /etc/multipath.conf
+
+        $ECHO "}" >> /etc/multipath.conf
+
+        $SYSTEMCTL restart multipathd
+            if [ $? -ne 0 ]; then
+                _err_msg_="Failed to restart multipathd Service"
+                abort_script "${_err_msg_}" "${EXEC_SHELL_CMD}"
+            fi
+        $ECHO "Successfully enabled the mpath values"
+
+else
+
+        $ECHO "/etc/multipath.conf file is already available and updated"
+
+fi
+}
+
+### Function: get_array_element ###
+#
+# Get the current array element number
+#
+# Arguments:
+#   none
+# Return Values:
+#   none
+get_array_element()
+{    
+_array_length_=${#LIN_REP_STAGES[*]}
+_array_length_=`${EXPR} ${_array_length_} - 1`
+
+for (( _elem_=0; _elem_<=${_array_length_}; _elem_++ )); do
+    $ECHO ${LIN_REP_STAGES[${_elem_}]} | $GREP -w ${NEXT_STAGE} >> /dev/null 2>&1
+    if [ $? -eq 0 ]; then
+        ARRAY_ELEM=${_elem_}
+        break
+    fi
+done
+}
+
+
+### Function: copy_replacement_conf ###
+#
+#   copy files from NAS to server
+#
+# Arguments:
+#       none
+# Return Values:
+#       none
+copy_replacement_conf()
+{
+
+SAN_DEVICE=`$CAT ${REP_DIR}/storage_type |$CUT -d "=" -f 2`
+if [ "${SAN_DEVICE}" == "unityXT" ]; then
+    copy_replacement_conf_unityXT
+    return 0
+fi
+logit "Reading values from ${USER_CONF}"
+_rep_nas_ip_=`$CAT ${USER_CONF} | $GREP "^REP_NAS_IP=" | $AWK -F\= '{print $2}'`
+_rep_nas_dir_=`$CAT ${USER_CONF} | $GREP "^REP_NAS_DIR=" | $AWK -F\= '{print $2}'`
+_rep_scp_pwd_1=`$CAT ${USER_CONF} | $GREP "^REP_NAS_PASS=" | $AWK -F"REP_NAS_PASS=" '{print $2}'`
+_rep_scp_pwd_1=`$ECHO ${_rep_scp_pwd_1} | $OPENSSL enc -base64 -d`
+_rep_scp_pwd_=$(/usr/bin/perl -e 'print quotemeta shift(@ARGV)' "${_rep_scp_pwd_1}")
+if [ $? -ne 0 ]; then
+    _err_msg_="Could not run perl command on support user PASSWORD"
+    abort_script "${_err_msg_}"
+fi
+
+if [ ! ${_rep_nas_ip_} -o ! ${_rep_nas_dir_} -o ! ${_rep_scp_pwd_} ]; then
+    _err_msg_="Could not get required information from ${USER_CONF} file."
+    abort_script "${_err_msg_}" "${EXEC_SHELL_CMD}"
+fi
+
+# Checking if SFS/VA ip is pingable
+logit "Checking the replacement_sw Backup Server IP ${_rep_nas_ip_} is pingable or not"
+$PING -c 1 ${_rep_nas_ip_} >> /dev/null 2>&1
+if [ $? -ne 0 ]; then
+   _err_msg_="Unable to ping replacement_SW Backup Server ip: ${_rep_nas_ip_}"
+    abort_script "${_err_msg_}" "${EXEC_SHELL_CMD}"
+fi
+
+logit "Copying replacement info to ${REP_SW_DIR}"
+scp_string="scp -r -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null"
+logit "Executing the below command: " 
+logit "${scp_string} ${REP_SCP_USER}@${_rep_nas_ip_}:${_rep_nas_dir_} /var/tmp" 
+
+# Copying required files from NAS location to server
+$EXPECT <<END
+    set timeout 5
+    spawn ${scp_string} ${REP_SCP_USER}@${_rep_nas_ip_}:${_rep_nas_dir_} /var/tmp
+    expect "Password:" 
+    send -- "${_rep_scp_pwd_}\r"
+    expect "100%"
+    sleep 1
+
+$EXPECT eof
+END
+# Copy replacement SW to /var/tmp
+if [ ! -d ${REP_SW_DIR} ];then
+    _err_msg_="Unable to copy replacement_sw to /var/tmp"
+    abort_script "$_err_msg_" "${EXEC_SHELL_CMD}"
+fi
+
+}
+
+### Function: copy_replacement_conf_unityXT ###
+#
+#   copy files from NAS to server in case of unity XT
+#
+# Arguments:
+#       none
+# Return Values:
+#       none
+copy_replacement_conf_unityXT()
+{
+logit "Reading values from ${USER_CONF}"
+_rep_nas_ip_=`$CAT ${USER_CONF} | $GREP "^REP_NAS_IP=" | $AWK -F\= '{print $2}'`
+_rep_nas_dir_=`$CAT ${USER_CONF} | $GREP "^REP_NAS_DIR=" | $AWK -F\= '{print $2}'`
+
+if [ ! ${_rep_nas_ip_} -o ! ${_rep_nas_dir_} ]; then
+    _err_msg_="Could not get required information from ${USER_CONF} file."
+    abort_script "${_err_msg_}" "${EXEC_SHELL_CMD}"
+fi
+
+# Checking if  ip is pingable
+logit "Checking the replacement_sw Backup Server IP ${_rep_nas_ip_} is pingable or not"
+$PING -c 1 ${_rep_nas_ip_} >> /dev/null 2>&1
+if [ $? -ne 0 ]; then
+   _err_msg_="Unable to ping replacement_SW Backup Server ip: ${_rep_nas_ip_}"
+    abort_script "${_err_msg_}" "${EXEC_SHELL_CMD}"
+fi
+
+VAR_TMP=/var/tmp
+mount_path=${REP_DIR}/bkup_dir
+
+if [ ! -d ${mount_path} ];then
+    $MKDIR -p ${mount_path}
+fi
+
+$DF -hk ${mount_path} | $GREP -w bkup_dir >> /dev/null 2>&1
+if [ $? -ne 0 ];then
+    $MOUNT -t nfs ${_rep_nas_ip_}:/${_rep_nas_dir_} ${mount_path}
+    if [ $? -ne 0 ];then
+        _err_msg_="Unable to mount ${_rep_nas_dir_} to ${mount_path}"
+        abort_script "$_err_msg_" "${EXEC_SHELL_CMD}"
+    fi
+fi
+
+#Copy replacement_sw
+if [ ! -d ${VAR_TMP}/replacement_sw ];then
+    $MKDIR -p ${VAR_TMP}/replacement_sw
+fi
+$CP -pr ${mount_path}/* ${VAR_TMP}/replacement_sw
+if [ $? -ne 0 ];then
+    _err_msg_="Unable copy  to replacement_sw /var/tmp"
+    abort_script "$_err_msg_" "${EXEC_SHELL_CMD}"
+fi
+
+logit "Sucessfuly copied replacement replacement_sw"
+
+$UMOUNT -l ${mount_path}
+if [ $? -ne 0 ];then
+    _err_msg_="Unable unmount ${mount_path}"
+    abort_script "$_err_msg_" "${EXEC_SHELL_CMD}"
+fi
+
+}
+
+
+### Function: get_absolute_path ###
+#
+# Determine absolute path to software
+#
+get_absolute_path()
+{
+_dir_=`$DIRNAME $0`
+SCRIPTHOME=`cd $_dir_ 2>/dev/null && pwd || $ECHO $_dir_`
+
+}
+
+### Function: get_blade_details ###
+#
+#   Get details of blade server from user
+#
+# Arguments:
+#       none
+# Return Values:
+#       none
+get_blade_details()
+{
+
+while :; do
+        _disp_file_=${TEM_DIR}/disp_file
+        $RM -rf ${_disp_file_} >> /dev/null 2>&1
+        $ECHO "============================================" > ${_disp_file_}
+        $ECHO "USER VALUE CONFIRMATION " >> ${_disp_file_}
+        $ECHO "============================================" >> ${_disp_file_}
+    
+_nm_service_="NetworkManager.service"
+_retry_=0
+
+while [ ${_retry_} -lt 2 ]; do
+    _nm_state_=`$SYSTEMCTL show ${_nm_service_} -p ActiveState | $CUT -f2 -d=`
+    if [ "${_nm_state_}" != "active" ]; then
+        logit "Starting ${_nm_service_}"
+        _nm_enabled_=`$SYSTEMCTL is-enabled ${_nm_service_}`
+        if [ "${_nm_enabled_}" != "enabled" ]; then
+            
+            $SYSTEMCTL enable ${_nm_service_} >>/dev/null 2>&1
+            if [ $? -ne 0 ]; then
+                logit "WARNING: Couldn't enable ${_nm_service_}"
+            fi
+        fi
+
+        $SYSTEMCTL start ${_nm_service_} >>/dev/null 2>&1
+    else
+        
+        break
+    fi
+    _retry_=$((_retry_+1))
+done
+
+$SLEEP 20
+    
+     #Get already plumbed service interface
+     _plumbed_service_intf_=`$NMCLI device | $GREP -w "connected" |$SORT -u |$AWK '{print $1}'`
+     if [ ! "${_plumbed_service_intf_}" ]; then
+           _err_msg_="Could not get interface plumbed during OS installation"
+           abort_script "${_err_msg_}" "${EXEC_SHELL_CMD}"
+     fi
+     
+     #Taking the user Input for Type of storage.
+     while :; do
+         $ECHO "Enter type of SAN storage device connected to this ENIQ deployment (e.g. vnx, unity, unityXT)"
+         read _storage_type_
+         if [ -z $_storage_type_ ]; then
+            continue
+         fi
+         break
+    done
+    $ECHO "SAN_DEVICE=${_storage_type_}" > ${REP_DIR}/storage_type 
+    SAN_DEVICE=${_storage_type_}
+     #Get interface for PM Service VLAN
+      interface_list "yes" "PM Services Group"
+      
+      $ECHO "PM VLAN Interface Name:${_plumbed_service_intf_} ${_pm_bond_intf_}" >> ${_disp_file_}
+        while :; do
+        user_confirm "Do you want to configure the Storage VLAN (Yy/Nn)"
+            if [ "${_response_}" == "YES" ]; then
+                confirmation="YES"
+                #UnityXT Handling
+                if [ "${SAN_DEVICE}" != "unityXT" ]; then
+                    interface_list "no" "Storage Group"
+                fi
+
+                while :; do
+                    $ECHO "Enter the Storage VLAN Interface IP "
+                    read _str_ip_
+                    validate_ip ${_str_ip_}
+                    if [ $? -ne 0 ]; then
+                        $ECHO "Could not validate ${_str_ip_}" >> ${LOGFILE}
+                        $ECHO "Please enter a valid ip address"
+                        continue
+                    fi
+                    break
+                done
+                   
+                while :; do
+                    $ECHO "Enter the Storage VLAN Interface NETMASK"
+                    read _str_net_ip_
+                    validate_ip ${_str_net_ip_}
+                    if [ $? -ne 0 ]; then
+                        $ECHO "Could not validate ${_str_net_ip_}" >> ${LOGFILE}
+                        $ECHO "Please enter a valid ip address"
+                        continue
+                    fi
+                    break
+                done
+                
+                # User enters storage gateway IP
+                while :; do
+                    $ECHO "Enter the Gateway IP address of Storage VLAN"
+                    read _stor_gateway_
+                    validate_ip ${_stor_gateway_}
+                    if [ $? -ne 0 ]; then
+                       $ECHO "Could not validate ${_stor_gateway_}" >> ${LOGFILE}
+                       $ECHO "Please enter a valid ip address"
+                       continue
+                    fi
+                    break
+                done
+                
+                #UnityXT Handling
+                if [ "${SAN_DEVICE}" == "unityXT" ]; then
+                    while :; do
+                        $ECHO "Enter the VLAN id of the Storage Group"
+                        read _stor_vlan_id_
+                        if [ -z ${_stor_vlan_id_} ]; then
+                           $ECHO "Could not get ${_stor_vlan_id_}" >> ${LOGFILE}
+                           $ECHO "Please enter a VLAN id of the Storage Group"
+                           continue
+                        fi
+                        break
+                done
+                fi
+                
+                #to get the arp-ip-target
+                #UnityXT Handling
+                if [ "${SAN_DEVICE}" != "unityXT" ]; then
+                    get_vlan_arp "Storage Group"
+                    _storage_arp_=${IPMP_ARP}
+                fi
+                get_network_addr "${_str_net_ip_}" "${_str_ip_}"
+                _net_=${_net_ip_}
+                _default_netmask_="${_net_}:${_str_net_ip_}"
+                _out_msg_="Enter the Storage Group VLAN network-number:netmask details"
+                get_netmask_info "${_out_msg_}" "${_default_netmask_}"
+                STORAGE_NETMASK_INFO=${NETMASK_INFO}
+                if [ ! "${STORAGE_NETMASK_INFO}" ]; then
+                   _err_msg_="Could not determine server network-number:netmask details"
+                   abort_script "${_err_msg_}"
+                fi
+                
+                $ECHO "Storage VLAN Bond Enable:Y" >> ${_disp_file_}
+                #UnityXT Handling
+                if [ "${SAN_DEVICE}" != "unityXT" ]; then
+                    $ECHO "Storage VLAN Interface Name:${_str_int_}" >> ${_disp_file_}
+                fi
+                $ECHO "Storage VLAN IP Address:${_str_ip_}" >> ${_disp_file_}
+                $ECHO "Storage VLAN Netmask IP Address:${_str_net_ip_}" >> ${_disp_file_}
+                $ECHO "Storage VLAN Gateway IP Address:${_stor_gateway_}" >> ${_disp_file_}
+                #UnityXT Handling
+                if [ "${SAN_DEVICE}" != "unityXT" ]; then
+                    $ECHO "Storage VLAN Highly Available Server IP Address:${_storage_arp_}" >> ${_disp_file_}
+                else
+                    $ECHO "Storage VLAN Id:${_stor_vlan_id_}" >> ${_disp_file_}
+                fi
+                $ECHO "Storage VLAN NETMASKS:${STORAGE_NETMASK_INFO}" >> ${_disp_file_}
+            else
+                confirmation="NO"
+                $ECHO "Storage VLAN Bond Enable:N" >> ${_disp_file_}
+                break
+            fi
+            break
+        done
+           
+        while :; do
+            user_confirm "Do you want to configure the Backup VLAN (Yy/Nn)"
+            if [ "${_response_}" == "YES" ]; then
+                backup_vlan_confirmation="YES"
+                #UnityXT Handling
+                if [ "${SAN_DEVICE}" != "unityXT" ]; then
+                    interface_list "no" "Backup Group"
+                fi
+                while :; do
+                    $ECHO "Enter the Backup VLAN Interface IP "
+                    read _bkp_ip_
+                    validate_ip ${_bkp_ip_}
+                    if [ $? -ne 0 ]; then
+                        $ECHO "Could not validate ${_bkp_ip_}" >> ${LOGFILE}
+                        $ECHO "Please enter a valid ip address"
+                        continue
+                    fi
+                    break
+                done
+                   
+                while :; do
+                    $ECHO "Enter the Backup VLAN Interface NETMASK"
+                    read _bkp_net_ip_
+                    validate_ip ${_bkp_net_ip_}
+                    if [ $? -ne 0 ]; then
+                        $ECHO "Could not validate ${_bkp_net_ip_}" >> ${LOGFILE}
+                        $ECHO "Please enter a valid ip address"
+                        continue
+                    fi
+                    break
+                done
+                
+               # User enters Backup gateway IP
+                while :; do
+                    $ECHO "Enter the Gateway IP address of Backup VLAN"
+                    read _bkp_gateway_
+                    validate_ip ${_bkp_gateway_}
+                    if [ $? -ne 0 ]; then
+                        $ECHO "Could not validate ${_bkp_gateway_}" >> ${LOGFILE}
+                        $ECHO "Please enter a valid ip address"
+                        continue
+                    fi
+                    break
+                done
+              #UnityXT Handling
+                if [ "${SAN_DEVICE}" == "unityXT" ]; then
+                    while :; do
+                        $ECHO "Enter the VLAN id of the Backup Group"
+                        read _bkup_vlan_id_
+                        if [ -z ${_bkup_vlan_id_} ]; then
+                           $ECHO "Could not get ${_bkup_vlan_id_}" >> ${LOGFILE}
+                           $ECHO "Please enter a VLAN id of the Backup Group"
+                           continue
+                        fi
+                        break
+                    done
+                fi
+                #to get the arp-ip-target
+                #UnityXT Handling
+                if [ "${SAN_DEVICE}" != "unityXT" ]; then
+                    get_vlan_arp "Backup Group"
+                    _bkp_arp_=${IPMP_ARP}
+                fi
+                get_network_addr "${_bkp_net_ip_}" "${_bkp_ip_}"
+                _net_=${_net_ip_}
+                _default_netmask_="${_net_}:${_bkp_net_ip_}"
+                _out_msg_="Enter the Backup Group VLAN network-number:netmask details"
+                get_netmask_info "${_out_msg_}" "${_default_netmask_}"
+                BACKUP_NETMASK_INFO=${NETMASK_INFO}
+                if [ ! "${BACKUP_NETMASK_INFO}" ]; then
+                   _err_msg_="Could not determine server network-number:netmask details"
+                   abort_script "${_err_msg_}"
+                fi
+                
+                $ECHO "Backup VLAN Bond Enable:Y" >> ${_disp_file_}
+                 #UnityXT Handling
+                if [ "${SAN_DEVICE}" != "unityXT" ]; then
+                    $ECHO "Backup VLAN Interface Name:${_backup_vlan_interface_name_}" >> ${_disp_file_}
+                fi
+                $ECHO "Backup VLAN IP Address:${_bkp_ip_}" >> ${_disp_file_}
+                $ECHO "Backup VLAN Netmask IP Address:${_bkp_net_ip_}" >> ${_disp_file_}
+                $ECHO "Backup VLAN Gateway IP Address:${_bkp_gateway_}" >> ${_disp_file_}
+                 #UnityXT Handling
+                if [ "${SAN_DEVICE}" != "unityXT" ]; then
+                    $ECHO "Backup VLAN Highly Available Server IP Address:${_bkp_arp_}" >> ${_disp_file_}
+                else
+                    $ECHO "Backup VLAN Id:${_bkup_vlan_id_}" >> ${_disp_file_}
+                fi
+                $ECHO "Backup VLAN NETMASKS:${BACKUP_NETMASK_INFO}" >> ${_disp_file_}
+        
+                break
+            else
+                backup_vlan_confirmation="NO"
+                $ECHO "Backup VLAN Bond Enable:N" >> ${_disp_file_}
+               break
+            fi
+
+
+        done
+
+        # Get IP address of replacement backup server
+        while :; do
+            $ECHO "Please enter IP address of Replacement Config backup server:"
+            read _rep_nas_ip_
+            validate_ip ${_rep_nas_ip_}
+            if [ $? -ne 0 ]; then
+                $ECHO "Could not validate ${_rep_nas_ip_}" >> ${LOGFILE}
+                $ECHO "Please enter a valid ip address."
+                continue
+            fi
+            break
+        done
+
+        # Get directory name of replacement sw on backup server
+        while :; do
+            $ECHO "Please enter Directory of Replacement Config on backup server:"
+            read _rep_nas_dir_
+            if [ -z $_rep_nas_dir_ ]; then
+                continue
+            fi
+            break
+        done
+
+        if [ "${SAN_DEVICE}" != "unityXT" ]; then
+            # Get password of NAS user "support"
+            while true
+            do
+                $ECHO "Please enter Password for \"${REP_SCP_USER}\" user :"
+                _rep_scp_pwd_=$(/usr/bin/perl -e 'system ("stty -echo");my $_temp_password_ =<STDIN>; print $_temp_password_; system ("stty echo");')
+                $ECHO "\nRe-Enter password for \"${REP_SCP_USER}\" user :"
+                _rep_scp_pwd_1=$(/usr/bin/perl -e 'system ("stty -echo");my $_temp_password_1 =<STDIN>;print $_temp_password_1; system ("stty echo");')
+                    if [ "${_rep_scp_pwd_}" == "${_rep_scp_pwd_1}" ]; then
+                        break
+                    else
+                        $ECHO "password mismatch. Try again..."
+                        $SLEEP 2
+                        continue
+                    fi
+            done
+            _rep_scp_pwd_=`$ECHO ${_rep_scp_pwd_} | $OPENSSL enc -base64`
+            if [ -z $_rep_scp_pwd_ ]; then
+                _err_msg_="Unable to encrypted password"
+                abort_script "${_err_msg_}" "${EXEC_SHELL_CMD}"
+            fi
+        fi
+        $ECHO "IP address of Replacement Config backup server: ${_rep_nas_ip_}" >> ${_disp_file_}
+        $ECHO "Directory of Replacement Config on backup server: ${_rep_nas_dir_}" >> ${_disp_file_}
+
+        # Display values to user
+        $CAT ${_disp_file_}
+        user_confirm
+
+        if [ "${_response_}" != "YES" ];then
+        unset _pm_bond_intf_ _str_int_ _backup_vlan_interface_name_ backup_vlan_confirmation
+            continue
+        fi
+
+        $CAT ${_disp_file_} >> ${LOGFILE}
+        if [ "${confirmation}" == "YES" ]; then
+        # Convert the netmask to subnet
+        _stor_subnet_=`get_network_from_netmask ${_str_net_ip_}`
+        fi
+        
+        _pm_bond_intf_="${_plumbed_service_intf_} ${_pm_bond_intf_}" 
+        
+        # Save the user input values
+        $ECHO "PM_VLAN_INTF=${_pm_bond_intf_}" >> ${USER_CONF}
+        $ECHO "STORAGE_VLAN_CONFIRMATION=${confirmation}" >> ${USER_CONF}
+        #UnityXT Handling
+        if [ "${SAN_DEVICE}" != "unityXT" ]; then
+            $ECHO "STOR_VLAN_INTF=${_str_int_}" >> ${USER_CONF}
+            $ECHO "STOR_ARP_IP=${_storage_arp_}" >> ${USER_CONF}
+        else
+            $ECHO "STOR_VLAN_Group_ID=${_stor_vlan_id_}" >>  ${USER_CONF}
+        fi
+        $ECHO "STOR_VLAN_IP=${_str_ip_}" >> ${USER_CONF}
+        $ECHO "STOR_VLAN_SUBNET=${_stor_subnet_}" >> ${USER_CONF}
+        $ECHO "STOR_VLAN_Netmask=${_str_net_ip_}" >> ${USER_CONF}
+        $ECHO "STOR_VLAN_GATEWAY=${_stor_gateway_}" >> ${USER_CONF}
+        $ECHO "STOR_NETMASK=${STORAGE_NETMASK_INFO}" >> ${USER_CONF}
+
+        #Saving Backup Information
+        $ECHO "BACKUP_VLAN_CONFIRMATION=${backup_vlan_confirmation}" >> ${USER_CONF} 
+        if [ "${SAN_DEVICE}" != "unityXT" ]; then
+            $ECHO "BACKUP_ARP_IP=${_bkp_arp_}" >> ${USER_CONF}
+            $ECHO "BACKUP_VLAN_INTF=${_backup_vlan_interface_name_}"  >> ${USER_CONF}
+        else
+            $ECHO "BACKUP_VLAN_Group_ID=${_bkup_vlan_id_}" >>  ${USER_CONF}
+        fi
+        $ECHO "BACKUP_VLAN_IP=${_bkp_ip_}" >> ${USER_CONF}
+        $ECHO "BACKUP_VLAN_Netmask=${_bkp_net_ip_}" >> ${USER_CONF}
+        $ECHO "BACKUP_VLAN_GATEWAY=${_bkp_gateway_}" >> ${USER_CONF}
+        $ECHO "BACKUP_NETMASK=${BACKUP_NETMASK_INFO}" >> ${USER_CONF}
+        if [ "${SAN_DEVICE}" != "unityXT" ]; then
+            $ECHO "REP_NAS_PASS=${_rep_scp_pwd_}" >> ${USER_CONF}
+        fi
+        $ECHO "REP_NAS_IP=${_rep_nas_ip_}" >> ${USER_CONF}
+        $ECHO "REP_NAS_DIR=${_rep_nas_dir_}" >> ${USER_CONF}
+        break
+    done
+    
+# Configure the storage vlan if needed.
+_str_conf_=`$CAT ${USER_CONF} | $GREP "^STORAGE_VLAN_CONFIRMATION=" | $AWK -F\= '{print $2}'`
+if [ ${_str_conf_} == "YES" ]; then
+
+    if [ "${SAN_DEVICE}" != "unityXT" ]; then
+        configure_storage_vlan
+    else
+       configure_storage_vlan_unityXT
+    fi
+fi
+
+}
+
+### Function: get_next_stage ###
+#
+# Get the stage to be run
+#
+get_next_stage()
+{
+ARRAY_ELEM=0
+
+if [ -s ${STAGEFILE} ]; then
+    NEXT_STAGE=`$CAT ${STAGEFILE}|$EGREP -v '^[     ]*#' | $SED -e 's| ||g'`
+    if [ ! "$NEXT_STAGE" ]; then
+        _err_msg_="ERROR: Failed to read stage from ${STAGEFILE}, exiting."
+        abort_script "$_err_msg_" "${EXEC_SHELL_CMD}"
+    fi
+    if [ "$NEXT_STAGE" == "cleanup" ]; then
+        return 0
+    else
+        $ECHO ${LIN_REP_STAGES[*]} | $GREP -w ${USER_STAGE} >> /dev/null 2>&1
+        if [ $? -eq 0 ]; then
+            _err_msg_="Specified stage ${USER_STAGE} is not a valid replacement stage"
+            abort_script "$_err_msg_" "${EXEC_SHELL_CMD}"
+        fi
+    fi
+    # Get the element number so we can move along the array
+    get_array_element
+else
+    $MKDIR -p `$DIRNAME ${STAGEFILE}`
+    if [ $? -ne 0 ]; then
+        _err_msg_="Failed to create directory `$DIRNAME ${STAGEFILE}`, exiting."
+        abort_script "$_err_msg_" "${EXEC_SHELL_CMD}"
+    fi
+    NEXT_STAGE=${LIN_REP_STAGES[${ARRAY_ELEM}]}
+fi
+}
+
+### Function: get_netmask_info ###
+#
+# Get the netmask information
+#
+# Arguments:
+#   $1 : Output Message String
+#   $2 : Optional Default Netmask details
+# Return Values:
+#   0 : Success
+#   1 : Fail
+get_netmask_info()
+{
+if [ ! "${1}" ]; then
+    $ECHO "OUtput Message sting must be provided to common_get_netmask_info function"
+    return 1
+fi
+local _out_msg_="${1}"
+
+if [ "${2}" ]; then
+    local _default_netmask_="${2}"
+fi
+
+while :; do
+    $PRINTF '\33[H\33[2J'
+    
+    $ECHO "\n\n${_out_msg_}"
+    if [ "${_default_netmask_}" ]; then
+    $ECHO "Hit enter for (${_default_netmask_})"
+    fi
+    read _netmask_
+
+    # If the User hit nothing No router required
+    if [ ! "${_netmask_}" ]; then
+        if [ "${_default_netmask_}" ]; then
+            NETMASK_INFO=${_default_netmask_}
+            break
+        fi
+        continue
+    fi
+
+    _net_=`$ECHO ${_netmask_} | $AWK -F\: '{print $1}'`
+    _mask_=`$ECHO ${_netmask_} | $AWK -F\: '{print $2}'`
+    
+    validate_ip ${_net_}
+    if [ $? -ne 0 ]; then
+        continue
+    fi
+    
+    validate_ip ${_mask_}
+    if [ $? -ne 0 ]; then
+        continue
+    fi
+    
+    NETMASK_INFO=${_netmask_}
+
+    break
+done
+
+
+}
+
+
+### Function: get_network_addr ###
+#
+# Get the network address of the client
+#
+# Arguments:
+#   $1 : Client Netmask
+#   $2 : Client IP
+# Return Values:
+#      : Network Address
+get_network_addr()
+{
+local _chk_=0 _tmp_ip_
+local nm1 nm2 nm3 nm4
+local sno1 sno2 sno3 sno4
+local snf1 snf2 snf3 snf4 
+
+# split out the parts of the netmask
+nm1=`$EXPR $1 : '\([0-9]*\)\..*'`
+nm2=`$EXPR $1 : '[0-9]*\.\([0-9]*\)\..*'`
+nm3=`$EXPR $1 : '[0-9]*\.[0-9]*\.\([0-9]*\)\..*'`
+nm4=`$EXPR $1 : '[0-9]*\.[0-9]*\.[0-9]*\.\([0-9]*\)'`
+
+# split out the parts of the server ip address
+sno1=`$EXPR $2 : '\([0-9]*\)\..*'`
+sno2=`$EXPR $2 : '[0-9]*\.\([0-9]*\)\..*'`
+sno3=`$EXPR $2 : '[0-9]*\.[0-9]*\.\([0-9]*\)\..*'`
+sno4=`$EXPR $2 : '[0-9]*\.[0-9]*\.[0-9]*\.\([0-9]*\)'`
+
+# AND the ipaddress and the netmask
+snf1=`$ECHO $((${sno1}&${nm1}))`
+snf2=`$ECHO $((${sno2}&${nm2}))`
+snf3=`$ECHO $((${sno3}&${nm3}))`
+snf4=`$ECHO $((${sno4}&${nm4}))`
+
+_tmp_ip_="${snf1}.${snf2}.${snf3}.${snf4}"
+_net_ip_=`$ECHO ${_tmp_ip_} | sed 's/ //g'`
+
+
+}
+
+### Function: get_network_from_netmask ###
+#
+# Get the network number suffix from netmask IP
+#
+# Arguments:
+#   $1 : Client Netmask IP
+# Return Values:
+#      : Network number suffix
+get_network_from_netmask()
+{
+local nm1 nm2 nm3 nm4
+local nm1_bin nm2_bin nm3_bin nm4_bin
+
+# split out the parts of the netmask
+nm1=`$EXPR $1 : '\([0-9]*\)\..*'`
+nm2=`$EXPR $1 : '[0-9]*\.\([0-9]*\)\..*'`
+nm3=`$EXPR $1 : '[0-9]*\.[0-9]*\.\([0-9]*\)\..*'`
+nm4=`$EXPR $1 : '[0-9]*\.[0-9]*\.[0-9]*\.\([0-9]*\)'`
+
+# Convert to binary
+
+nm1_bin=`echo "obase=2;$nm1" | bc`
+nm2_bin=`echo "obase=2;$nm2" | bc`
+nm3_bin=`echo "obase=2;$nm3" | bc`
+nm4_bin=`echo "obase=2;$nm4" | bc`
+
+prefix="$nm1_bin$nm2_bin$nm3_bin$nm4_bin"
+
+# Count number of 1's, (awk -1)
+
+num=`echo $prefix | awk 'BEGIN{FS="1"} {print NF-1}'`
+
+$ECHO ${num}
+
+}
+
+
+### Function: get_user_input ###
+#
+#   Read server type from user
+#
+# Arguments:
+#       none
+# Return Values:
+#       none
+get_user_input()
+{
+$CLEAR
+$ECHO "============================================"
+$ECHO "Getting Replacement Information from User"
+$ECHO "============================================"
+get_blade_details
+logit "Successfully taken user inputs."
+
+}
+
+### Function: get_vlan_arp ###
+#
+# inirator question to get the highly available server IP
+#
+# Arguments:
+#   $1 : bond group name
+# Return Values:
+#   none
+#
+get_vlan_arp()
+{
+local _ipmp_grp_name_=$1
+
+while :; do
+    $PRINTF '\33[H\33[2J'
+    unset _ipmp_arp_value_ IPMP_ARP _invalid_ip_
+
+    $ECHO "\nEnter the IP address of at least one highly available servers in the same subnet as ${_ipmp_grp_name_}"
+    case "${_ipmp_grp_name_}" in
+        "PM Services Group") _ip_type_="MWS Server IP"
+            ;;
+        "Storage Group") _ip_type_="NAS Console IP"
+            ;;
+        "Backup Group") _ip_type_="OMBS Server IP"
+            ;;
+    esac
+    $ECHO "(${_ip_type_} Should be given as mandatory entry)"
+    $ECHO "If there are multiple IP addresses to be entered, then they should be separated by comma"
+    read _ipmp_arp_value_
+
+    _ipmp_arp_values_=`$ECHO ${_ipmp_arp_value_} | $SED -e 's/ //g'`
+
+    _arp_list_=`$ECHO ${_ipmp_arp_values_} | $TR ',' ' '`
+
+    _number_arp_=`$ECHO ${_arp_list_} | $WC -w`
+
+    if [ ${_number_arp_} -lt 1 ]; then
+        $ECHO "Please enter at-least one IP which are in same subnet, press <enter> to continue"
+        read _wait_
+        continue
+    fi
+
+    for i in ${_arp_list_}; do
+        validate_ip ${i}
+        if [ $? -ne 0 ]; then
+            _invalid_ip_="Y"
+        fi
+    done
+
+    if [ "${_invalid_ip_}" == "Y" ]; then
+        continue
+    fi
+
+    IPMP_ARP="${_ipmp_arp_values_}"
+    break
+done
+
+
+}
+
+### Function: import_vg ###
+# 
+# Importing Volume Group after connecting storage
+#Arguments: none
+#
+# Return Values:none
+#   
+import_vg()
+{
+insert_header_footer head "Entering Replacement Stage - ${NEXT_STAGE}" ${LOGFILE}
+# Flag to check VG import needed or not
+_import_needed_=0
+
+# Get VG name from replacement conf file
+_vg_name_=`$CAT ${REPLACEMENT_CONF} | $GREP "^VOLUME_GROUP_TO_IMPORT_" | $CUT -d'=' -f2`
+if [ ! ${_vg_name_} ]; then
+    _err_msg_="Unable to get the VOLUME_GROUP_TO_IMPORT from ${REPLACEMENT_CONF}"
+    abort_script "${_err_msg_}" "${EXEC_SHELL_CMD}"
+fi
+
+_pool_=`$VGS -o vg_name --noheading | $GREP -vw "vg_root" | $AWK '{print $1}'`
+
+
+$ECHO ${_pool_} | $GREP -w ${_vg_name_} >> /dev/null 2>&1
+if [ $? -ne 0 ];then
+    _import_needed_=1
+else
+    #Check if VG with exported attributes
+    _vg_export_check_=`vgs ${_vg_name_} -o attr --noheading | awk '{print $1}'`
+    if [ ! ${_vg_export_check_} ];then
+        _err_msg_="Unable to get the attributes of ${_vg_name_}."
+        abort_script "${_err_msg_}" "${EXEC_SHELL_CMD}"
+    else
+        if [ ${_vg_export_check_} == "wzx-n-" ];then
+            _import_needed_=1
+        else
+            _import_needed_=0
+        fi
+    fi
+fi
+
+if [ $_import_needed_ -eq 1 ];then
+    $VGIMPORT -f ${_vg_name_} >> /dev/null 2>&1
+    if [ $? -ne 0 ];then
+        _err_msg_="Could not import Volume Group ${_vg_name_}."
+        abort_script "${_err_msg_}" "${EXEC_SHELL_CMD}"
+    fi        
+    log "Volume Group ${_vg_name_} imported successfully."
+else
+    log "Volume Group ${_vg_name_} already imported."
+fi
+
+$VGCHANGE -ay ${_vg_name_} >> /dev/null 2>&1
+if [ $? -ne 0 ];then
+    _err_msg_="VGCHANGE of ${_vg_name_} is not done properly."
+    abort_script "${_err_msg_}" "${EXEC_SHELL_CMD}"
+fi
+
+#Preparing for the recreate ENIQ structure execution
+log "Mounting /dev/mapper/${_vg_name_}-installation to /eniq/installation"
+$MOUNT /dev/mapper/${_vg_name_}-installation /eniq/installation >> /dev/null 2>&1
+if [ $? -ne 0 ]; then
+    _err_msg_="Unable to Mount /dev/mapper/${_vg_name_}-installation on /eniq/installation"
+    abort_script "${_err_msg_}" "${EXEC_SHELL_CMD}"
+fi
+
+#Creation of root backup directory
+$MKDIR -p ${MOUNT_POINT_BKUP}
+if [ $? -ne 0 ];then
+    _err_msg_="Could not create ${MOUNT_POINT_BKUP}"
+    abort_script "${_err_msg_}" "${EXEC_SHELL_CMD}"
+fi
+
+log "Mounting /dev/mapper/${_vg_name_}-${BACKUP_DIR} to ${MOUNT_POINT_BKUP}"
+$MOUNT /dev/mapper/${_vg_name_}-${BACKUP_DIR} ${MOUNT_POINT_BKUP} >> /dev/null 2>&1
+if [ $? -ne 0 ]; then
+    _err_msg_="Unable to Mount /dev/mapper/${_vg_name_}-${BACKUP_DIR} on ${MOUNT_POINT_BKUP}"
+    abort_script "${_err_msg_}" "${EXEC_SHELL_CMD}"
+fi
+
+
+if [ -f ${USER_CONF} ];then
+_pm_interface_name_=`$CAT ${USER_CONF} | $GREP "^PM_VLAN_INTF=" | $AWK -F\= '{print $2}'` || abort_script "${_pm_interface_name_}" "${EXEC_SHELL_CMD}"
+$ECHO "PM_VLAN_INTF_NAME=${_pm_interface_name_}"  >> ${REPLACEMENT_CONF}
+
+_storage_vlan_=`$CAT ${USER_CONF} | $GREP "^STORAGE_VLAN_CONFIRMATION=" | $AWK -F\= '{print $2}'` || abort_script "${_storage_vlan_}" "${EXEC_SHELL_CMD}"
+if [ "${_storage_vlan_}" == "YES" ];then
+$ECHO "STORAGE_VLAN_CONFIRMATION=${_storage_vlan_}"  >> ${REPLACEMENT_CONF}
+_storage_interface_name_=`$CAT ${USER_CONF} | $GREP "^STOR_VLAN_INTF=" | $AWK -F\= '{print $2}'` || abort_script "${_storage_interface_name_}" "${EXEC_SHELL_CMD}"
+$ECHO "STORAGE_VLAN_INTF_NAME=${_storage_interface_name_}"  >> ${REPLACEMENT_CONF} 
+_storage_interface_ip_=`$CAT ${USER_CONF} | $GREP "^STOR_VLAN_IP=" | $AWK -F\= '{print $2}'` || abort_script "${_storage_interface_ip_}" "${EXEC_SHELL_CMD}"
+$ECHO "STORAGE_VLAN_IP=${_storage_interface_ip_}"  >> ${REPLACEMENT_CONF}
+_storage_interface_Netmask_=`$CAT ${USER_CONF} | $GREP "^STOR_VLAN_Netmask=" | $AWK -F\= '{print $2}'` || abort_script "${_storage_interface_Netmask_}" "${EXEC_SHELL_CMD}"
+$ECHO "STORAGE_VLAN_Netmask=${_storage_interface_Netmask_}"  >> ${REPLACEMENT_CONF}
+_storage_interface_gateway_=`$CAT ${USER_CONF} | $GREP "^STOR_VLAN_GATEWAY=" | $AWK -F\= '{print $2}'` || abort_script "${_storage_interface_gateway_}" "${EXEC_SHELL_CMD}"
+$ECHO "STOR_VLAN_GATEWAY=${_storage_interface_gateway_}"  >> ${REPLACEMENT_CONF}
+_storage_interface_arp_ip_=`$CAT ${USER_CONF} | $GREP "^STOR_ARP_IP=" | $AWK -F\= '{print $2}'` || abort_script "${_storage_interface_arp_ip_}" "${EXEC_SHELL_CMD}"
+$ECHO "STOR_VLAN_ARP_IP=${_storage_interface_arp_ip_}"  >> ${REPLACEMENT_CONF}
+_storage_interface_vlan_NETMASK_=`$CAT ${USER_CONF} | $GREP "^STOR_NETMASK=" | $AWK -F\= '{print $2}'` || abort_script "${_storage_interface_vlan_NETMASK_}" "${EXEC_SHELL_CMD}"
+$ECHO "STOR_NETMASK=${_storage_interface_vlan_NETMASK_}"  >> ${REPLACEMENT_CONF}
+
+_storage_vlan_id_=`$CAT ${USER_CONF} | $GREP "^STOR_VLAN_Group_ID=" | $AWK -F\= '{print $2}'` || abort_script "${_storage_vlan_id_}" "${EXEC_SHELL_CMD}"
+$ECHO "STOR_VLAN_Group_ID=${_storage_vlan_id_}"  >> ${REPLACEMENT_CONF}
+
+fi
+
+_backup_vlan_=`$CAT ${USER_CONF} | $GREP "^BACKUP_VLAN_CONFIRMATION=" | $AWK -F\= '{print $2}'` || abort_script "${_storage_vlan_}" "${EXEC_SHELL_CMD}"
+
+if [ "${_backup_vlan_}" == "YES" ];then
+$ECHO "BACKUP_VLAN_CONFIRMATION=${_backup_vlan_}"  >> ${REPLACEMENT_CONF}
+_backup_interface_name_=`$CAT ${USER_CONF} | $GREP "^BACKUP_VLAN_INTF=" | $AWK -F\= '{print $2}'` || abort_script "${_backup_interface_name_}" "${EXEC_SHELL_CMD}"
+$ECHO "BACKUP_VLAN_INTF_NAME=${_backup_interface_name_}"  >> ${REPLACEMENT_CONF}
+_backup_interface_ip_=`$CAT ${USER_CONF} | $GREP "^BACKUP_VLAN_IP=" | $AWK -F\= '{print $2}'` || abort_script "${_backup_interface_ip_}" "${EXEC_SHELL_CMD}"
+$ECHO "BACKUP_VLAN_IP=${_backup_interface_ip_}"  >> ${REPLACEMENT_CONF}
+_backup_interface_Netmask_=`$CAT ${USER_CONF} | $GREP "^BACKUP_VLAN_Netmask=" | $AWK -F\= '{print $2}'` || abort_script "${_backup_interface_Netmask_}" "${EXEC_SHELL_CMD}"
+$ECHO "BACKUP_VLAN_Netmask=${_backup_interface_Netmask_}"  >> ${REPLACEMENT_CONF}
+_backup_interface_gateway_=`$CAT ${USER_CONF} | $GREP "^BACKUP_VLAN_GATEWAY=" | $AWK -F\= '{print $2}'` || abort_script "${_backup_interface_gateway_}" "${EXEC_SHELL_CMD}"
+$ECHO "BACKUP_VLAN_GATEWAY=${_backup_interface_gateway_}"  >> ${REPLACEMENT_CONF}
+_backup_interface_arp_ip_=`$CAT ${USER_CONF} | $GREP "^BACKUP_ARP_IP=" | $AWK -F\= '{print $2}'` || abort_script "${_backup_interface_arp_ip_}" "${EXEC_SHELL_CMD}"
+$ECHO "BACKUP_VLAN_ARP_IP=${_backup_interface_arp_ip_}"  >> ${REPLACEMENT_CONF}
+_backup_interface_vlan_NETMASK_=`$CAT ${USER_CONF} | $GREP "^BACKUP_NETMASK=" | $AWK -F\= '{print $2}'` || abort_script "${_backup_interface_vlan_NETMASK_}" "${EXEC_SHELL_CMD}"
+$ECHO "BACKUP_NETMASK=${_backup_interface_vlan_NETMASK_}"  >> ${REPLACEMENT_CONF}
+
+_bkup_vlan_id_=`$CAT ${USER_CONF} | $GREP "^BACKUP_VLAN_Group_ID=" | $AWK -F\= '{print $2}'` || abort_script "${_bkup_vlan_id_}" "${EXEC_SHELL_CMD}"
+$ECHO "BACKUP_VLAN_Group_ID=${_bkup_vlan_id_}"  >> ${REPLACEMENT_CONF}
+fi
+
+fi
+insert_header_footer foot "Successfully completed Replacement Stage - ${NEXT_STAGE}" ${LOGFILE}
+set_next_stage `$EXPR ${ARRAY_ELEM} + 1`
+
+}
+
+### Function: insert_header_footer ###
+#
+#   Insert a stage header/footer message
+#
+# Arguments:
+#   $1 : head/foot
+#   $2 : Message
+#   $3 : Logfile
+# Return Values:
+#   none
+insert_header_footer()
+{
+if [ $# -ne 3 ]; then
+    _err_msg_="3 Parameters must be passed to header/footer function"
+    abort_script "$_err_msg_" "${EXEC_SHELL_CMD}"
+fi    
+
+_type_=$1
+_msg_=$2
+_logfile_=$3
+
+if [ "$_type_" != "head" -a "$_type_" != "foot" ]; then
+    _err_msg_="Only Param of head/foot is allowed...exiting!"
+    abort_script "$_err_msg_" "${EXEC_SHELL_CMD}"
+fi    
+
+$MKDIR -p `$DIRNAME ${_logfile_}`
+if [ $? -ne 0 ]; then
+    _err_msg_="Could not create directory `$DIRNAME ${_logfile_}`"
+    abort_script "$_err_msg_" "${EXEC_SHELL_CMD}"
+fi    
+
+$TOUCH -a ${_logfile_}
+if [ $? -ne 0 ]; then
+    _err_msg_="Could not write to file ${_logfile_}"
+    abort_script "$_err_msg_" "${EXEC_SHELL_CMD}"
+fi
+
+_time_=`$DATE '+%Y-%b-%d_%H.%M.%S'`
+if [ "$_type_" == "head" ]; then
+    $ECHO "=====================================================" | $TEE -a ${_logfile_}
+    $ECHO "-----------------------------------------------------" | $TEE -a ${_logfile_}
+    $ECHO "$_time_ : $_msg_" | $TEE -a ${_logfile_}
+    $ECHO "-----------------------------------------------------" | $TEE -a ${_logfile_}
+fi
+
+if [ "$_type_" == "foot" ]; then
+    $ECHO "-----------------------------------------------------" | $TEE -a ${_logfile_}
+    $ECHO "$_time_ : $_msg_" | $TEE -a ${_logfile_}
+    $ECHO "-----------------------------------------------------" | $TEE -a ${_logfile_}
+    $ECHO "=====================================================" | $TEE -a ${_logfile_}
+fi
+
+}
+
+### Function: install_emc_pkg ###
+#
+#   Install EMC SW
+#
+# Arguments:
+#       none
+# Return Values:
+#       none
+install_emc_pkg()
+{
+insert_header_footer head "Entering Replacement Stage - ${NEXT_STAGE}" ${LOGFILE}
+
+logit "INFO: Executing steps to connect storage"
+# Install the EMC SW
+if [ ${SAN_DEVICE} == "vnx" ]; then
+    _emc_pkg_list_="NAVISCLI HOSTAGENT"
+elif [ ${SAN_DEVICE} == "unity" -o ${SAN_DEVICE} == "unityXT" ]; then
+    _emc_pkg_list_="UnisphereCLI"
+else
+    _err_msg_="Invalid ${SAN_DEVICE} type."
+    abort_script "$_err_msg_" "${EXEC_SHELL_CMD}"
+fi
+
+for _pkg_ in $_emc_pkg_list_; do
+    $RPM -qa | $GREP ${_pkg_} 2>/dev/null
+    if [ $? -eq 0 ];then
+        logit "${_pkg_} already installed."
+        continue
+    else
+        if [ "${SAN_DEVICE}" == "vnx" ]; then
+            _pkg_=NAVISCLI,HOSTAGENT
+        fi
+        # Add the package
+        logit "Installing ${_pkg_} package....."
+        $BASH ${OM_SW_DIR}/EMC/install_emc_sw.bsh -l $_pkg_ | $TEE -a ${LOGFILE}
+        if [ $? -ne 0 ];then
+            _err_msg_="Unable to install EMC SW package $_pkg_ "
+            abort_script "$_err_msg_" "${EXEC_SHELL_CMD}"
+        fi
+    fi
+done
+logit "INFO: Successfully Installed EMC SW."
+
+insert_header_footer foot "Successfully completed Replacement Stage - ${NEXT_STAGE}" ${LOGFILE}
+set_next_stage `$EXPR ${ARRAY_ELEM} + 1`
+
+}
+
+### Function: install_stor_pkg ###
+#
+#   Install STOR pkgs
+#
+# Arguments:
+#       none
+# Return Values:
+#       none
+install_stor_pkg()
+{
+    
+# Install the STOR pkgs
+_stor_api_pkg_="ERICstorapi"
+_stor_api_source_dir_=storage
+
+# Is the package already installed? If so remove it
+$RPM -qa | $GREP ${_stor_api_pkg_} 2>/dev/null
+if [ $? -eq 0 ]; then
+    logit "Removing current instance of ${_stor_api_pkg_}" | $TEE -a ${LOGFILE}
+    $RPM -evh ${_stor_api_pkg_}
+    if [ $? -ne 0 ]; then
+        _err_msg_="Failed to remove ${_stor_api_pkg_}"
+        abort_script "${_err_msg_}" "${EXEC_SHELL_CMD}"
+    fi
+    logit "Successfully updated Storage API SW"
+else
+    logit "Adding ${_stor_api_pkg_}"
+fi
+
+$RPM -ivh ${OM_SW_DIR}/${_stor_api_source_dir_}/${_stor_api_pkg_}* 2>/dev/null | $TEE -a ${_logfile_}
+_pkg_install_status_=`$ECHO ${PIPESTATUS[0]}`
+if [ ${_pkg_install_status_} -ne 0 ]; then
+    _err_msg_="Failed to add ${_stor_api_pkg_}"
+    abort_script "${_err_msg_}" "${EXEC_SHELL_CMD}"
+fi
+logit "INFO: Successfully Installed Storage API."
+
+}
+
+
+### Function: log ###
+#
+# Basically outputs to the screen and the logfile
+# insert function
+#
+log() 
+{
+if [ "${LOGFILE}" ]; then
+    $ECHO "$*" |$TEE -a ${LOGFILE}
+else
+    $ECHO "$*"
+fi
+}
+
+
+### Function: logit ###
+#
+#   Displays message to user and logs as well
+#
+# Arguments:
+#       $* : Message to display and log
+# Return Values:
+#       none
+logit()
+{
+_msg_=$*
+_timestamp_=`$DATE '+%Y-%b-%d_%H:%M:%S'`
+
+$ECHO "${_timestamp_}:: ${_msg_}" | $TEE -a ${LOGFILE}
+}
+
+### Function: read_value ###
+#
+#   Common function to get value from file
+#   having the param=value format
+#
+# Arguments:
+#       $1 : Parameter name
+#       $2 : File name
+# Return Values:
+#       $_value_
+read_value()
+{
+if [ $# -ne 2 ];then
+    _err_msg_="Incorrect number of arguments passed to read_value"
+    $ECHO "${_err_msg_}"
+    exit 1
+fi
+
+_param_=$1
+_file_=$2
+
+if [ ! -s ${_file_} ];then
+    _err_msg_="Could not find ${_file_} to read value from."
+    $ECHO "${_err_msg_}"
+    exit 1
+fi
+
+_value_=""
+# Read the value
+_value_=`$CAT ${_file_} | $GREP "^${_param_}=" | $CUT -f 2 -d =`
+if [ ! "${_value_}" ];then
+    _err_msg_="Could not get the ${_param_} value from ${_file_} file."
+    $ECHO "${_err_msg_}"
+    exit 1
+fi
+$ECHO $_value_
+}
+
+
+### Function: set_conf_value ###
+#
+#   Common function to set value in file
+#   having the param=value format
+#
+# Arguments:
+#       $1 : Parameter name
+#       $2 : Value
+#       $3 : File name
+# Return Values:
+#       none
+set_conf_value()
+{
+if [ $# -ne 3 ];then
+    _err_msg_="Incorrect number of parameters passed to set_conf_value"
+    abort_script "${_err_msg_}" "${EXEC_SHELL_CMD}"
+fi
+
+_param_=$1
+_value_=$2
+_file_=$3
+
+# Update param=value
+# Check if the param exists in file
+$CAT ${_file_} | $GREP "^${_param_}=" >> /dev/null
+if [ $? -ne 0 ];then
+    $ECHO "${_param_}=${_value_}" >> ${_file_}
+else
+    $CAT ${_file_} | $SED 's/"${_param_}=*"/"${_param_}=${_value_}"/' > /tmp/updated_file.$$.$$
+    if [ $? -ne 0 ];then
+        _err_msg_="Failed to update ${_param_} value in ${_file_}"
+        abort_script "${_err_msg_}" "${EXEC_SHELL_CMD}"
+    fi
+    $MV /tmp/updated_file.$$.$$ ${_file_}
+    if [ $? -ne 0 ];then
+        _err_msg_="Failed to save ${_param_} value in ${_file_}"
+        abort_script "${_err_msg_}" "${EXEC_SHELL_CMD}"
+    fi
+fi
+}
+
+
+### Function: set_next_stage ###
+#
+# Set up the stage to be run
+#
+# Arguments:
+#   $1 : Stage to be set to. Either numeric value or 'cleanup'
+# Return Values:
+#   none
+set_next_stage()
+{
+_stage_time_=`$DATE '+%Y-%b-%d_%H.%M.%S'`
+$ECHO "# Setting new stage at $_stage_time_" > ${STAGEFILE} | $TEE -a ${LOGFILE}
+$ECHO "${LIN_REP_STAGES[$1]} " >> ${STAGEFILE} | $TEE -a ${LOGFILE}
+}
+
+### Function: setup_replacement_env###
+#
+#   Read NAS details from user
+#
+# Arguments:
+#       none
+# Return Values:
+#       none
+setup_replacement_env()
+{
+
+ERICSSON_STOR_DIR=/ericsson/storage
+ENIQ_BASE_DIR=/eniq
+ENIQ_INST_DIR=${ENIQ_BASE_DIR}/installation
+ENIQ_CORE_INST_DIR=${ENIQ_INST_DIR}/core_install
+ENIQ_CONF_DIR=${ENIQ_INST_DIR}/config
+REPLACEMENT_CONF_ORIG=${ENIQ_CONF_DIR}/replacement_${HNAME}.conf
+ENIQ_REPLACEMENT_SCRIPT=${ENIQ_CORE_INST_DIR}/bin/eniq_linux_replacement.bsh
+
+#BACKUP_DIR_NAME
+BACKUP_DIR=replacement_root_backup
+MOUNT_POINT_BKUP=/eniq/replacement
+
+if [ ! -s ${USER_CONF} ]; then
+    _err_msg_="Could not find ${USER_CONF}"
+    abort_script "${_err_msg_}" "${EXEC_SHELL_CMD}"
+fi
+
+
+if [ ! -s ${REPLACEMENT_CONF} ];then
+    _err_msg_="${REPLACEMENT_CONF} file is not configured or doesn't exist."
+    abort_script "${_err_msg_}" "${EXEC_SHELL_CMD}"
+fi
+
+# Read the storage type
+SAN_DEVICE=`read_value SAN_DEVICE_TYPE ${REPLACEMENT_CONF}` || abort_script "${SAN_DEVICE}" "${EXEC_SHELL_CMD}"
+if [ "${SAN_DEVICE}" != "unity" -a "${SAN_DEVICE}" != "vnx" -a "${SAN_DEVICE}" != "unityXT" ];then
+    _err_msg_="SAN_DEVICE_TYPE ${SAN_DEVICE} not supported."
+    abort_script "${_err_msg_}" "${EXEC_SHELL_CMD}"
+fi 
+    
+# Get OM SW
+if [ ! "${OM_SW_DIR}" ];then
+    OM_SW_DIR=`read_value REP_OM_SW_LOC ${REPLACEMENT_CONF}` || abort_script "${OM_SW_DIR}" "${EXEC_SHELL_CMD}"
+fi
+
+# Host Agent IP
+HOST_AGENT_IP=`read_value HOST_AGENT_IP ${REPLACEMENT_CONF}` || abort_script "${HOST_AGENT_IP}" "${EXEC_SHELL_CMD}"
+
+
+STAGEFILE=${REP_DIR}/continue_replacement_stage
+
+}
+
+### Function: start_replacement ###
+#
+#Calling eniq_linux_replacement.bsh to 
+#continue the replacement
+#
+start_replacement()
+{
+insert_header_footer head "Entering Linux Replacement stage ${NEXT_STAGE}" ${LOGFILE}
+
+_vg_name_=`$CAT ${REPLACEMENT_CONF} | $GREP "^VOLUME_GROUP_TO_IMPORT_" | $CUT -d'=' -f2`
+if [ ! ${_vg_name_} ]; then
+    _err_msg_="Unable to get the VOLUME_GROUP_TO_IMPORT from ${REPLACEMENT_CONF}"
+    abort_script "${_err_msg_}" "${EXEC_SHELL_CMD}"
+fi
+
+log "Checking Volume Group status."
+_vg_import_check_=`$VGS ${_vg_name_} -o attr --noheading | awk '{print $1}'`
+if [ ! ${_vg_import_check_} ];then
+    _err_msg_="Unable to get the attributes of ${_vg_name_}."
+    abort_script "${_err_msg_}" "${EXEC_SHELL_CMD}"
+else
+    if [ ${_vg_import_check_} != "wzx-n-" ];then
+        log "VGs are imported properly."
+    else
+        _err_msg_="All Pools are not imported. Please check."
+        abort_script "${_err_msg_}" "${EXEC_SHELL_CMD}"
+    fi
+fi
+  
+if [ ! -s ${REPLACEMENT_CONF_ORIG} ]; then
+    _err_msg_="${REPLACEMENT_CONF_ORIG} does not exist or empty"
+    abort_script "${_err_msg_}" "${EXEC_SHELL_CMD}"
+else
+    _action_type_=`read_value REPLACEMENT_ACTION ${REPLACEMENT_CONF_ORIG}` || abort_script "${_action_type_}" "${EXEC_SHELL_CMD}"
+fi
+
+log "VGs are online."
+
+
+if [ ! -f "${ENIQ_REPLACEMENT_SCRIPT}" ];then
+    _err_msg_="Replacement script ${ENIQ_REPLACEMENT_SCRIPT} not found."
+    abort_script "${_err_msg_}" "${EXEC_SHELL_CMD}"
+fi
+
+logit "Starting to execute Replacement using command : $BASH ${ENIQ_REPLACEMENT_SCRIPT} -a ${_action_type_} -C"
+$BASH ${ENIQ_REPLACEMENT_SCRIPT} -a ${_action_type_} -C
+if [ $? -ne 0 ]; then
+    _err_msg_="Could not execute ${ENIQ_REPLACEMENT_SCRIPT}"
+    abort_script "$_err_msg_" "${EXEC_SHELL_CMD}"  
+else
+    local _next_stage_=`$EXPR ${ARRAY_ELEM} + 1`
+    insert_header_footer foot "Successfully completed Replacement Stage - ${NEXT_STAGE} " ${LOGFILE}
+    set_next_stage ${_next_stage_}
+fi    
+}
+
+### Function: user_confirm ###
+#
+# This function will confirm the user input
+# 
+#
+# Arguments:none
+#       
+# Return Values:response yes/no
+#       
+#       
+user_confirm()
+{
+
+_usr_msg_=$1
+
+if [ ! "$1" ]; then
+    _usr_msg_="Do you want to proceed with above values? (Yy/Nn)"
+fi
+
+unset _response_
+
+while [ 1 ]
+do
+    $ECHO ${_usr_msg_}
+    read ans
+
+    case $ans in
+      Y|y) _response_="YES"
+                       break
+                       ;;
+      N|n) _response_="NO"
+                    break
+                    ;;
+      *) $ECHO "Invalid input. Enter again."
+         ;;
+    esac
+done
+}
+
+### Function: validate_ip ###
+#
+# This function will check that an
+# IP address is valid
+#
+# Arguments:
+#       $1 : IP address to be validated
+# Return Values:
+#       0 : Success
+#       1 : Error
+validate_ip()
+{
+_chk_ip_=$1
+_err_flag_=0
+
+if [[ ${_chk_ip_} =~ ^[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}$ ]]; then
+    _orig_ifs_="$IFS"
+    IFS='.'
+
+    _chk_ip_array_=($_chk_ip_)
+    IFS="${_orig_ifs_}"
+
+    _array_length_="${#_chk_ip_array_[@]}"
+    if [ ${_array_length_} -ne 4 ]; then
+        _err_flag_=1
+    fi
+
+    for (( i=0; i<${_array_length_}; i++ )); do
+        if [ ${_chk_ip_array_[$i]} -lt 0 -o ${_chk_ip_array_[$i]} -gt 255 ]; then
+                _err_flag_=1
+        fi
+    done
+else
+    local ipv6=$1
+
+    # The Regex expresion to match IPv6 adresses
+    IPv6_REGEXP='^\s*((([0-9A-Fa-f]{1,4}:){7}([0-9A-Fa-f]{1,4}|:))|(([0-9A-Fa-f]{1,4}:){6}(:[0-9A-Fa-f]{1,4}|((25[0-5]|2[0-4]\d|1\d\d|[1-9]?\d)(\.(25[0-5]|2[0-4]\d|1\d\d|[1-9]?\d)){3})|:))|(([0-9A-Fa-f]{1,4}:){5}(((:[0-9A-Fa-f]{1,4}){1,2})|:((25[0-5]|2[0-4]\d|1\d\d|[1-9]?\d)(\.(25[0-5]|2[0-4]\d|1\d\d|[1-9]?\d)){3})|:))|(([0-9A-Fa-f]{1,4}:){4}(((:[0-9A-Fa-f]{1,4}){1,3})|((:[0-9A-Fa-f]{1,4})?:((25[0-5]|2[0-4]\d|1\d\d|[1-9]?\d)(\.(25[0-5]|2[0-4]\d|1\d\d|[1-9]?\d)){3}))|:))|(([0-9A-Fa-f]{1,4}:){3}(((:[0-9A-Fa-f]{1,4}){1,4})|((:[0-9A-Fa-f]{1,4}){0,2}:((25[0-5]|2[0-4]\d|1\d\d|[1-9]?\d)(\.(25[0-5]|2[0-4]\d|1\d\d|[1-9]?\d)){3}))|:))|(([0-9A-Fa-f]{1,4}:){2}(((:[0-9A-Fa-f]{1,4}){1,5})|((:[0-9A-Fa-f]{1,4}){0,3}:((25[0-5]|2[0-4]\d|1\d\d|[1-9]?\d)(\.(25[0-5]|2[0-4]\d|1\d\d|[1-9]?\d)){3}))|:))|(([0-9A-Fa-f]{1,4}:){1}(((:[0-9A-Fa-f]{1,4}){1,6})|((:[0-9A-Fa-f]{1,4}){0,4}:((25[0-5]|2[0-4]\d|1\d\d|[1-9]?\d)(\.(25[0-5]|2[0-4]\d|1\d\d|[1-9]?\d)){3}))|:))|(:(((:[0-9A-Fa-f]{1,4}){1,7})|((:[0-9A-Fa-f]{1,4}){0,5}:((25[0-5]|2[0-4]\d|1\d\d|[1-9]?\d)(\.(25[0-5]|2[0-4]\d|1\d\d|[1-9]?\d)){3}))|:)))(%.+)?\s*$'
+
+    if [[ "$ipv6" =~ $IPv6_REGEXP ]] ; then
+            # Valid IPv6 address
+            echo "ipv6"
+    else
+        # not valid IPv6 address
+        echo "not_valid"
+        _err_flag_=1
+    fi
+fi
+
+if [ ${_err_flag_} -eq 0 ]; then
+    return 0
+else
+    return 1
+fi
+}
+
+
+### Function: get_storage_password ###
+#
+# This function will check if the replacement conf file has the 
+# storage password, if not present - get it from the user 
+# and set it to the conf file.
+# Arguments:
+#       none
+# Return Values:
+#       none
+get_storage_password()
+{
+_no_of_san_=`$CAT ${REPLACEMENT_CONF} | $GREP "^STORAGE_NAME_" | $WC -l`
+
+    for (( _count_=1; $_count_<=$_no_of_san_; _count_++ ));do
+        _stor_name_=`read_value STORAGE_NAME_${_count_} ${REPLACEMENT_CONF}` || abort_script "${_stor_name_}" "${EXEC_SHELL_CMD}"
+        $CAT ${REPLACEMENT_CONF} | $GREP "^STORAGE_PASS_${_count_}" >> /dev/null 2>&1
+        if [ $? -ne 0 ]; then
+            while true
+            do
+                $ECHO "Enter the admin user password of $_stor_name_:"
+                _stor_pass_=$(/usr/bin/perl -e 'system ("stty -echo");my $_temp_san_password_ =<STDIN>; print $_temp_san_password_; system ("stty echo");')
+                $ECHO "\nRe-Enter the admin user password of $_stor_name_:"
+                _stor_pass1_=$(/usr/bin/perl -e 'system ("stty -echo");my $_temp_san_password_1 =<STDIN>; print $_temp_san_password_1; system ("stty echo");')
+                if [ "${_stor_pass_}" == "${_stor_pass1_}" ]; then
+                    _stor_pass_=`$ECHO ${_stor_pass_} | $OPENSSL enc -base64`
+                    set_conf_value "STORAGE_PASS_${_count_}" ${_stor_pass_} ${REPLACEMENT_CONF}
+                    break
+                else
+                    $ECHO "password mismatch. Try again..."
+                    $SLEEP 2
+                    continue
+                fi
+            done
+        fi
+    done
+}
+
+
+### Function: interface_list###
+#
+#   Read backup_vlan_interface_name from user
+#
+# Arguments:
+#       none
+# Return Values:
+#       none
+interface_list()
+{
+_ask_for_single_interface_="$1"
+_intf_group_="$2"
+_nm_service_="NetworkManager.service"
+_retry_=0
+
+while [ ${_retry_} -lt 2 ]; do
+    _nm_state_=`$SYSTEMCTL show ${_nm_service_} -p ActiveState | $CUT -f2 -d=`
+    if [ "${_nm_state_}" != "active" ]; then
+        
+        _nm_enabled_=`$SYSTEMCTL is-enabled ${_nm_service_}`
+        if [ "${_nm_enabled_}" != "enabled" ]; then
+            
+            $SYSTEMCTL enable ${_nm_service_} >>/dev/null 2>&1
+            if [ $? -ne 0 ]; then
+                logit "WARNING: Couldn't enable ${_nm_service_}"
+            fi
+        fi
+
+        $SYSTEMCTL start ${_nm_service_} >>/dev/null 2>&1
+    else
+        
+        break
+    fi
+    _retry_=$((_retry_+1))
+done
+
+
+
+# List the interfaces which are not configured
+$NMCLI dev | $GREP -w "disconnected" >> /dev/null 2>&1
+if [ $? -ne 0 ]; then
+    _err_msg_="No interface available for configuration on system."
+    abort_script "${_err_msg_}" "${EXEC_SHELL_CMD}"
+fi
+
+
+$NMCLI device | $GREP "disconnected" |$SORT -u |$AWK '{print $1}' > /tmp/available_interfaces
+
+$RM -rf /tmp/available_interfaces_with_mac
+
+for _available_interface_ in `$CAT /tmp/available_interfaces`
+do
+    _mac_addr_=`$IFCONFIG ${_available_interface_} 2> /dev/null | $EGREP "ether" | $AWK '{print $2}'`
+    $ECHO "${_available_interface_} ${_mac_addr_}" >> /tmp/available_interfaces_with_mac
+done
+
+if [ -z "${_pm_bond_intf_}" ]; then
+        $CAT /tmp/available_interfaces_with_mac
+else
+       if [ "${_intf_group_}" == "Storage Group" ]; then
+            $CAT /tmp/available_interfaces_with_mac | $GREP -v ${_pm_bond_intf_}
+       else 
+               if [ "${confirmation}" == "YES" ]; then
+                     $ECHO ${_str_int_} > /tmp/int_name
+                     _int_name_1_=`$CAT /tmp/int_name | $AWK '{print $1}'`
+                     _int_name_2_=`$CAT /tmp/int_name | $AWK '{print $2}'`
+                    $CAT /tmp/available_interfaces_with_mac | $GREP -v ${_pm_bond_intf_}| $GREP -v ${_int_name_1_} | $GREP -v ${_int_name_2_}
+               else 
+                    $CAT /tmp/available_interfaces_with_mac | $GREP -v ${_pm_bond_intf_}
+               fi
+        fi
+fi
+
+while :; do
+
+if [ "${_ask_for_single_interface_}" == "yes" ]; then
+     $ECHO "\nSelect one appropriate group interface configured for ${_intf_group_} from the list above (Example :<Interface_1>)"
+     _num_required_intf=1
+else
+     $ECHO "\nSelect two appropriate group interfaces configured for ${_intf_group_} from the list above separated by a space (Example :<Interface_1> <Interface_2>)"
+     _num_required_intf=2
+fi
+
+read _opt_
+
+if [ ! "${_opt_}" ]; then
+    continue
+fi
+
+_num_choice_=`$ECHO ${_opt_} | $WC -w`
+
+_opt_arr_=(${_opt_})
+
+if [ ${_num_choice_} -eq ${_num_required_intf} ]; then
+     if [ "${_ask_for_single_interface_}" == "no" ]; then
+          if [ ${_opt_arr_[0]} == ${_opt_arr_[1]} ]; then
+               $ECHO "Invalid interfaces, press <enter> to continue"
+               read _wait_
+               continue
+          fi
+     fi
+
+
+    _input_err_=0
+    for _interface_ in ${_opt_}; do
+            _entered_intf_=`$CAT /tmp/available_interfaces | $GREP ${_interface_}`
+
+            if [ "${_entered_intf_}" != "${_interface_}" ]; then
+                  _input_err_=1
+            fi
+    done
+    if [ ${_input_err_} -eq 1 ]; then
+            $ECHO "Incorrect interfaces entered, press <enter> to continue"
+            read _wait_
+            continue
+    fi
+
+elif [ ${_num_choice_} -ne ${_num_required_intf} ]; then
+        $ECHO "Incorrect format entered, press <enter> to continue"
+        read _wait_
+        continue
+fi
+if [ "${backup_vlan_confirmation}" == "YES" ]; then
+    _backup_vlan_interface_name_="${_opt_}"
+elif [ "${confirmation}" == "YES" ]; then
+    _str_int_="${_opt_}"
+else
+   _pm_bond_intf_="${_opt_}"
+fi
+
+
+break
+done
+
+ }
+# ********************************************************************
+#
+#     Main body of program
+#
+# ********************************************************************
+#
+# Set the terminal
+${STTY} sane
+export TERM=linux
+HOME=/root
+export HOME
+
+RUN_TIME=`$DATE '+%Y-%b-%d_%H.%M.%S'`
+
+check_id $DEFAULT_USER
+
+get_absolute_path
+
+# Create TEM_DIR
+TEM_DIR=/tmp/continue_replacement.$$.$$
+$MKDIR -p ${TEM_DIR} 
+
+# Create a directory for replacement operations
+REP_DIR=/var/tmp/continue_replacement
+if [ ! -d ${REP_DIR} ]; then
+    $MKDIR -p ${REP_DIR}
+fi
+
+USER_CONF=${REP_DIR}/replacement_input.conf
+
+# Logfile name
+LOG_STAMP=`$DATE '+%Y-%b-%d'`
+LOGFILE=${REP_DIR}/continue_eniq_replacement_${LOG_STAMP}.log
+$TOUCH ${LOGFILE} >> /dev/null 2>&1
+
+log "======= Starting to run continue_eniq_replacement.bsh on $RUN_TIME ======="
+
+# Copy the script to /var/tmp/continue_replacement directory in case of second run
+SCRIPTPATH=$0
+SCRIPTNAME=`basename $0`
+if [ ! -f ${REP_DIR}/$SCRIPTNAME ];then 
+    $CP $SCRIPTPATH ${REP_DIR} >> /dev/null 2>&1
+    if [ ! -f ${REP_DIR}/$SCRIPTNAME ];then
+        _err_msg_="Failed to copy $SCRIPTNAME to ${REP_DIR}."
+        abort_script "${_err_msg_}" "${EXEC_SHELL_CMD}"
+    fi
+fi
+
+
+# Get required info from user if running for first time
+if [ ! -s ${USER_CONF} ]; then
+    get_user_input
+fi
+
+# Copy replacement conf from NAS location to /var/tmp
+if [ ! -d ${REP_SW_DIR} ];then
+    copy_replacement_conf
+fi
+
+# Validate if storage password is present in replacement conf file and get the input from the user if not present
+get_storage_password
+
+# Setting up all the replacement related files and directories
+setup_replacement_env
+
+# Get the stage to run
+get_next_stage
+
+# If we read cleanup from the stagefile
+if [ "$NEXT_STAGE" == "cleanup" ]; then
+        # Clean up as it may not be done already
+        $ECHO "All Stages are already completed" 
+        exit 0    
+fi
+
+while :; do
+    _nxt_stage_="${NEXT_STAGE}"
+    $_nxt_stage_
+    if [ $? -ne 0 ]; then
+        _err_msg_="Error in Stage ${NEXT_STAGE}"
+        abort_script "$_err_msg_" "${EXEC_SHELL_CMD}"
+    fi
+
+    # If we read cleanup from the stagefile
+    if [ "$NEXT_STAGE" == "cleanup" ]; then
+        break
+    fi
+
+    get_next_stage
+done
+
+exit 0

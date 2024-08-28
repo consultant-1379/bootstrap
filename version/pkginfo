@@ -1,0 +1,5 @@
+PKGINST=bootstrap
+NAME=ENIQ Media bootstrap
+ARCH=i386/sparc
+VERSION=R13F01
+PRODNUM=CXP9019555

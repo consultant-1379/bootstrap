@@ -1,0 +1,1870 @@
+#!/bin/bash
+# ********************************************************************
+# Ericsson Radio Systems AB      SCRIPT                                    
+# ********************************************************************
+#
+#
+# (c) Ericsson Radio Systems AB 2022 - All rights reserved.
+#
+# The copyright to the computer program(s) herein is the property
+# of Ericsson Radio Systems AB, Sweden. The programs may be used
+# and/or copied only with the written permission from Ericsson Radio
+# Systems AB or in accordance with the terms and conditions stipulated
+# in the agreement/contract under which the program(s) have been
+# supplied.
+#
+# ********************************************************************
+#
+# Name    : expansion_automation.bsh
+# Date    : 10/10/2023
+# Revision: \main\04
+# Purpose : This script will be called to perform Expansion Automation.
+#           
+# Usage   : expansion_automation.bsh
+#
+# ********************************************************************
+#
+#   Command Section
+#
+# ********************************************************************
+AWK=/usr/bin/awk
+BASENAME=/usr/bin/basename
+BASH=/usr/bin/bash
+CAT=/usr/bin/cat
+CHMOD=/usr/bin/chmod
+CLEAR=/usr/bin/clear
+DATE=/usr/bin/date
+DIRNAME=/usr/bin/dirname
+DRACUT=/usr/sbin/dracut
+ECHO='/usr/bin/echo -e'
+EGREP=/usr/bin/egrep
+ENV=/usr/bin/env
+EXPECT=/usr/bin/expect
+EXPR=/usr/bin/expr
+GREP=/usr/bin/grep
+MYHOSTNAME=/usr/bin/hostname
+MKDIR=/usr/bin/mkdir
+PING=/usr/bin/ping
+PS=/usr/bin/ps
+PWD=/usr/bin/pwd
+PYTHON=/usr/bin/python
+RM=/usr/bin/rm
+SCP=/usr/bin/scp
+SED=/usr/bin/sed
+SLEEP=/usr/bin/sleep
+SSH=/usr/bin/ssh
+SUDO=/usr/bin/sudo
+TEE=/usr/bin/tee
+TOUCH=/usr/bin/touch
+TR=/usr/bin/tr
+WC=/usr/bin/wc
+
+
+
+
+# ********************************************************************
+#
+#       Configuration Section
+#
+# ********************************************************************
+# Cmd to exec a shell and drop user to it in case of an error
+EXEC_SHELL_CMD="exec /bin/bash -o emacs"
+
+
+# Host name
+HNAME=`$MYHOSTNAME`
+
+
+# Build an array to store the stage names
+EXP_STAGES=( get_expansion_inputs
+setup_ssh_connectivity
+storage_expansion
+Reboot_ENIQ
+database_expansion
+post_expansion
+cleanup
+)
+
+
+# *********************
+#
+# Functions
+#
+# *********************
+
+### Function: ### Function: abort_script ###
+#
+#   This will be called if the script is aborted through an error
+#   signal sent by the kernel if a serious
+#   error encountered during runtime
+#
+# Arguments:
+#       $1 - Error message from part of program (Not always used)
+#       $2 - EXEC_SHELL_CMD
+# Return Values:
+#       none
+abort_script()
+{
+if [ "$1" ]; then
+    _err_msg_="ERROR: $1"
+else
+    _err_msg_="ERROR: Script aborted......."
+fi
+if [ "${LOGFILE}" ]; then
+    $ECHO "$_err_msg_" | $TEE -a ${LOGFILE}
+else
+    $ECHO "$_err_msg_" | $TEE -a ${LOGFILE}
+fi
+cd $SCRIPTHOME || return
+$RM -rf "/var/tmp/pid_of_expansion_process"
+if [ "$2" ]; then
+    ${2} 
+else
+   exit 1
+fi
+}
+
+
+setup_env()
+{
+CONFIG_FILE="/var/tmp/input_file1.txt"
+input_file2="/var/tmp/input_file2.txt"
+input_file3="/var/tmp/input_file3.txt"
+target_file="/var/tmp/target_conf.txt"
+
+#SSH command with options
+RUN_REM_CMD="$SSH -o StrictHostKeyChecking=no -o BatchMode=yes"
+if [ -s "/var/tmp/san_type" ]; then
+    _san_type_=$($CAT /var/tmp/san_type | $GREP -w "SAN_DEVICE" | $AWK -F "=" '{print $2}' | $TR -d '\r')
+    if [ -z "$_san_type_" ]; then
+        err_msg="Could not fetch SAN type for ENIQ server"
+        abort_script "$err_msg"
+    fi
+fi
+}
+
+### Function: cleanup ###
+#
+# Final stage. Clean up
+#
+# Arguments:
+#       none
+# Return Values:
+#       none
+cleanup()
+{
+# Remove the TEMP directory
+insert_header_footer head "Entering expansion stage - ${NEXT_STAGE}" ${LOGFILE}
+$ECHO "$CONFIG_FILE $input_file2 $input_file3 $target_file" | $TR " " "\n" > /var/tmp/removal_list.txt
+for entry in `$CAT /var/tmp/removal_list.txt`; do
+    $ECHO "Removing $entry" >> "${LOGFILE}"
+    $RM -rf $entry
+    if [ $? -ne 0 ]; then
+       _err_msg_="Could not remove $entry"
+       abort_script "$_err_msg_" 
+    fi
+done
+
+remove_list_1="file_list.txt
+continue_expansion_stage 
+pid_of_expansion_process 
+temp_file.txt 
+progress 
+snap_ids
+server_list.txt
+ssh_setup_logfile
+ssh_keygen
+reboot_eniq_completed
+reboot_nt_initiated
+reboot_nt_succ
+max_rbt_timout
+precheck
+pre_check
+ping_server_status.log
+storage_expansion_completed
+_precheck_done
+san_type"
+for entry in `$ECHO ${remove_list_1}`; do
+    $ECHO "Removing $entry" >> "${LOGFILE}"
+        $RM -rf /var/tmp/$entry
+        if [ $? -ne 0 ]; then
+           _err_msg_="Could not remove $entry"
+       abort_script "$_err_msg_"
+        fi
+done
+$RM -rf /var/tmp/removal_list.txt
+insert_header_footer foot "Successfully completed - ${NEXT_STAGE}." ${LOGFILE}
+return 0
+}
+
+
+
+expansion_check_user_stage(){
+
+if [ ! $1 ]; then
+   echo "ERROR: User stage not set, exiting"
+   exit 1
+else
+   _user_stage_=$1
+fi
+echo "Checking if user specified stage - ${_user_stage_} - is valid" 
+echo "${EXP_STAGES[@]}" | grep -w ${_user_stage_} >> /dev/null 2>&1
+if [ $? -ne 0 ]; then
+    echo "Specified stage ${_user_stage_} not a valid Expansion stage" 
+    exit 1
+else
+    echo "Specified stage ${_user_stage_} is a Expansion stage" 
+fi
+}
+
+
+### Function: get_absolute_path ###
+#
+# Determine absolute path to software
+#
+# Arguments:
+#   none
+# Return Values:
+#   none
+get_absolute_path()
+{
+_dir_=`$DIRNAME $0`
+SCRIPTHOME=`cd $_dir_ 2>/dev/null && pwd || $ECHO $_dir_`
+}
+
+
+### Function: get_array_element ###
+#
+# Get the current array element number
+#
+# Arguments:
+#   none
+# Return Values:
+#   none
+get_array_element()
+{    
+_array_length_=${#EXP_STAGES[*]}
+_array_length_=`${EXPR} ${_array_length_} - 1`
+
+for (( _elem_=0; _elem_<=${_array_length_}; _elem_++ )); do
+    $ECHO ${EXP_STAGES[${_elem_}]} | $GREP -w ${NEXT_STAGE} >> /dev/null 2>&1
+    if [ $? -eq 0 ]; then
+        ARRAY_ELEM=${_elem_}
+        break
+    fi
+done
+}
+
+
+
+### Function: get_next_stage ###
+#
+# Get the stage to be run
+#
+get_next_stage()
+{
+ARRAY_ELEM=0
+
+if [ -s ${STAGEFILE} ]; then
+    NEXT_STAGE=`$CAT ${STAGEFILE}|$EGREP -v '^[     ]*#' | $SED -e 's| ||g'`
+    if [ ! "$NEXT_STAGE" ]; then
+        _err_msg_="ERROR: Failed to read stage from ${STAGEFILE}, exiting."
+        abort_script "$_err_msg_" "${EXEC_SHELL_CMD}"
+    fi
+    if [ "$NEXT_STAGE" == "cleanup" ]; then
+        return 0
+    else
+        if [ ${USER_STAGE} ]; then
+            $ECHO "${EXP_STAGES[@]}" | $GREP -w ${USER_STAGE} >> /dev/null 2>&1 
+            if [ $? -ne 0 ]; then
+                _err_msg_="Specified stage ${USER_STAGE} is not a valid expansion stage"
+                abort_script "$_err_msg_" "${EXEC_SHELL_CMD}"
+            fi
+        else 
+            $ECHO "${EXP_STAGES[@]}" | $GREP -w ${NEXT_STAGE} >> /dev/null 2>&1
+            if [ $? -ne 0 ]; then
+                _err_msg_="Specified stage ${NEXT_STAGE]} is not a valid expansion stage"
+                abort_script "$_err_msg_" "${EXEC_SHELL_CMD}"
+            fi
+        fi
+    fi
+    # Get the element number so we can move along the array
+    get_array_element
+else
+    $MKDIR -p "`$DIRNAME ${STAGEFILE}`"
+    if [ $? -ne 0 ]; then
+        _err_msg_="Failed to create directory `$DIRNAME ${STAGEFILE}`, exiting."
+        abort_script "$_err_msg_" "${EXEC_SHELL_CMD}"
+    fi
+    NEXT_STAGE=${EXP_STAGES[${ARRAY_ELEM}]}
+fi
+}
+
+### Function: ssh_setup ###
+#
+#Runs a command on a remote sever and returns the return value from the command
+#
+# Arguments:
+#   $1 : hostname/ip
+#   $2 : username
+#   $2 : password
+# Return Values:
+#      : Return value from the command
+
+ssh_setup()
+{
+local host="${1}"
+local username="${2}"
+local passd="${3}"
+SSH_setup_LOGFILE=/var/tmp/ssh_setup_logfile
+$EXPECT <<EOF >${SSH_setup_LOGFILE} 2>&1
+set timeout 20
+spawn su root -c "ssh-copy-id ${username}@${host}"
+expect {
+"(yes/no)?" {send -- "yes\r";exp_continue}
+"password:" {send -- "${passd}\r";exp_continue}
+timeout {send user "\nTIMEOUT\n"; exit 9}
+}
+expect eof
+EOF
+    
+}
+
+
+### Function: copy_files_to_ENIQ ###
+#
+#   This will copy files from
+#   MWS server to ENIQ server
+#
+# Arguments:
+#    : NONE
+# Return Values:
+#    : Command output
+copy_files_to_ENIQ()
+{
+local host 
+host=`$CAT $CONFIG_FILE | $GREP -i "ENIQ_hostname" | $AWK -F "::" '{print $2}'`
+if [ -z ${ip} ]; then
+    _err_msg_="Could not find ip from $CONFIG_FILE"
+    abort_script "$_err_msg_" 
+fi
+$ECHO "\nCopying files to the ENIQ server:" | $TEE -a "${LOGFILE}"
+path_to_ENIQ_Server=/var/tmp
+copy_list_2="target_conf.txt
+input_file1.txt"
+for entry in `$ECHO ${copy_list_2}`; do
+if [ "${_ip_type_}" == "IPv6" ]; then
+    $SCP -6 /var/tmp/${entry} ${username}@[${host}]:${path_to_ENIQ_Server}  >> /dev/null 2>&1
+    if [ $? -eq 0 ]; then
+           $ECHO "\nSuccessfully copied file ${entry} to the ENIQ server" | $TEE -a "${LOGFILE}"
+    else
+           _err_msg_="Failed to copy file ${entry} to the ENIQ server"
+           abort_script "$_err_msg_"
+    fi
+else
+    $SCP /var/tmp/${entry} ${username}@${host}:${path_to_ENIQ_Server}  >> /dev/null 2>&1
+    if [ $? -eq 0 ]; then
+           $ECHO "\nSuccessfully copied file ${entry} to the ENIQ server" | $TEE -a "${LOGFILE}"
+    else
+           _err_msg_="Failed to copy file ${entry} to the ENIQ server"
+           abort_script "$_err_msg_"
+    fi
+fi
+done
+}
+
+### Function: user_confirm ###
+#
+#   Take user confirmation
+#
+# Arguments:
+#   $1 : User display message
+# Return Values:
+#   User response : YES/NO
+user_confirm()
+{
+if [ $1 ] ;then
+    _usr_msg_="$1"
+else
+    _usr_msg_="\n\nDo you want to proceed with the above information? (Yy/Nn/quit)"
+fi
+unset _response_
+
+while [ 1 ]
+do
+    $ECHO ${_usr_msg_}
+    read ans
+
+    case $ans in
+        Y|y|YES|Yes|yes) _response_="YES"
+                         break
+                         ;;
+        N|n|NO|No|no) _response_="NO"
+                         break
+                         ;;
+        quit|QUIT|Quit) _response_="QUIT"
+                         break
+                         ;;
+        *) $ECHO  "\nInvalid input. Enter again." | $TEE -a "${LOGFILE}"
+           ;;
+    esac
+done
+
+}
+
+
+
+### Function: validate_ip ###
+#
+# This function will check that an
+# IP address is valid
+#
+# Arguments:
+#    $1 : IP address to be validated
+# Return Values:
+#       0 : Success
+#       1 : Error
+validate_ip()
+{
+_chk_ip_=$1    
+_err_flag_=0
+
+if [[ ${_chk_ip_} =~ ^[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}$ ]]; then
+    _orig_ifs_="$IFS"
+    IFS='.'
+    
+    _chk_ip_array_=($_chk_ip_)
+    IFS="${_orig_ifs_}"
+    
+    _array_length_="${#_chk_ip_array_[@]}"
+    if [ ${_array_length_} -ne 4 ]; then
+        _err_flag_=1
+    fi
+    
+    for (( i=0; i<${_array_length_}; i++ )); do
+        if [[ ${_chk_ip_array_[$i]} -lt 0 || ${_chk_ip_array_[$i]} -gt 255 ]]; then
+            _err_flag_=1
+        fi
+    done
+else
+    local ipv6=$1
+
+    # The Regex expresion to match IPv6 adresses
+    IPv6_REGEXP='^\s*((([0-9A-Fa-f]{1,4}:){7}([0-9A-Fa-f]{1,4}|:))|(([0-9A-Fa-f]{1,4}:){6}(:[0-9A-Fa-f]{1,4}|((25[0-5]|2[0-4]\d|1\d\d|[1-9]?\d)(\.(25[0-5]|2[0-4]\d|1\d\d|[1-9]?\d)){3})|:))|(([0-9A-Fa-f]{1,4}:){5}(((:[0-9A-Fa-f]{1,4}){1,2})|:((25[0-5]|2[0-4]\d|1\d\d|[1-9]?\d)(\.(25[0-5]|2[0-4]\d|1\d\d|[1-9]?\d)){3})|:))|(([0-9A-Fa-f]{1,4}:){4}(((:[0-9A-Fa-f]{1,4}){1,3})|((:[0-9A-Fa-f]{1,4})?:((25[0-5]|2[0-4]\d|1\d\d|[1-9]?\d)(\.(25[0-5]|2[0-4]\d|1\d\d|[1-9]?\d)){3}))|:))|(([0-9A-Fa-f]{1,4}:){3}(((:[0-9A-Fa-f]{1,4}){1,4})|((:[0-9A-Fa-f]{1,4}){0,2}:((25[0-5]|2[0-4]\d|1\d\d|[1-9]?\d)(\.(25[0-5]|2[0-4]\d|1\d\d|[1-9]?\d)){3}))|:))|(([0-9A-Fa-f]{1,4}:){2}(((:[0-9A-Fa-f]{1,4}){1,5})|((:[0-9A-Fa-f]{1,4}){0,3}:((25[0-5]|2[0-4]\d|1\d\d|[1-9]?\d)(\.(25[0-5]|2[0-4]\d|1\d\d|[1-9]?\d)){3}))|:))|(([0-9A-Fa-f]{1,4}:){1}(((:[0-9A-Fa-f]{1,4}){1,6})|((:[0-9A-Fa-f]{1,4}){0,4}:((25[0-5]|2[0-4]\d|1\d\d|[1-9]?\d)(\.(25[0-5]|2[0-4]\d|1\d\d|[1-9]?\d)){3}))|:))|(:(((:[0-9A-Fa-f]{1,4}){1,7})|((:[0-9A-Fa-f]{1,4}){0,5}:((25[0-5]|2[0-4]\d|1\d\d|[1-9]?\d)(\.(25[0-5]|2[0-4]\d|1\d\d|[1-9]?\d)){3}))|:)))(%.+)?\s*$'
+
+    if [[ "$ipv6" =~ $IPv6_REGEXP ]] ; then
+            # Valid IPv6 address
+            echo "ipv6"
+    else
+        # not valid IPv6 address
+        echo "not_valid"
+        _err_flag_=1
+    fi
+fi
+
+if [ ${_err_flag_} -eq 0 ]; then
+    return 0
+else
+    return 1
+fi
+}
+
+
+
+### Function: get_user_confirmation_input ###
+#
+# This function will collect
+# all the required inputs
+# from user
+#
+# Arguments:
+#         $1: input needed for which server [ ENIQ/ OMBS]
+# Return Values:
+#         user_confirmation:confirmation
+get_user_confirmation_input()
+{
+unset confirmation
+server="$1"
+if [ ${server} == "ENIQ" ] || [ ${server} == "OMBS" ] || [ ${server} == "OMBS_policy" ] || [ ${server} == "expansion_continue" ]; then
+      if [ ${server} == "ENIQ" ]; then
+         usr_msg="Confirm if deployment is Co-deployed setup with ENM [Y/N]?:"
+      fi
+      if [ ${server} == "OMBS" ]; then
+         usr_msg="Confirm if ENIQ server is connected to OMBS server [Y/N]?:"
+      fi
+      if [ ${server} == "OMBS_policy" ]; then
+         usr_msg="Do you want to disbale OMBS policies for the ENIQ the server [Y/N]?:"
+      fi
+      if [ ${server} == "expansion_continue" ]; then
+         usr_msg="Do you want to continue with Database Expansion procedure as well on ENIQ server which involves downtime [Y/N]?:\nNote: For more details, see section Downtime Information in ENIQ Statistic Expansion Document "
+         
+      fi
+fi
+while :; do
+    $ECHO "\n$usr_msg"
+    read confirmation
+            # Did user enter anything
+    if [ ! "${confirmation}" ]; then
+        continue
+    fi
+            if [ "${confirmation}" == "Y" ] || [ "${confirmation}" == "N" ]; then
+                break
+            else
+                continue
+            fi
+    break
+done
+export confirmation
+}
+
+
+### Function: get_input_ip ###
+#
+# This function will ip address for servers
+#
+# Arguments:
+#         $1: input needed for which server [ ENIQ/ OMBS]
+# Return Values:
+#         user_confirmation:confirmation
+get_input_ip()
+{
+unset ip_address
+server="$1"
+if [ ${server} == "ENIQ" ] || [ ${server} == "OMBS" ]; then
+      if [ ${server} == "ENIQ" ]; then
+         usr_msg="Enter IP address of ENIQ server:"
+      fi
+      if [ ${server} == "OMBS" ]; then
+         usr_msg="Enter IP address of OMBS server:"
+      fi
+fi
+while :; do
+    $ECHO "\n${usr_msg}"
+    read ip_address
+    # Did user enter anything
+    if [ ! "${ip_address}" ]; then
+        continue
+    fi
+    if [ ${server} == "ENIQ" ]; then
+        ping -c 4 ${ip_address} >> /dev/null 2>&1
+        if [ $? -ne 0 ]; then
+            $ECHO "Entered ENIQ Server IP ${ip_address} is not Reachable" | $TEE -a ${LOGFILE}
+            continue
+        else
+            break
+        fi
+    fi
+    validate_ip ${ip_address}
+    if [ $? -ne 0 ]; then
+        continue
+    fi
+    break
+done
+#export $ip_address
+}
+
+### Function: get_host_name ###
+#
+# This function will ip address for servers
+#
+# Arguments:
+#         $1: input needed for which server [ ENIQ/ OMBS]
+# Return Values:
+#         user_confirmation:confirmation
+get_host_name()
+{
+unset host_name
+usr_msg="Enter host name of ENIQ server:"
+while :; do
+    $ECHO "\n${usr_msg}"
+    read host_name
+    # Did user enter anything
+    if [ ! "${host_name}" ]; then
+        continue
+    fi
+    break
+done
+#export $ip_address
+}
+
+
+
+### Function: get_input_username ###
+#
+# This function will collect username for servers
+#
+# Arguments:
+#         $1: input needed for which server [ ENIQ/ OMBS]
+# Return Values:
+#         user_confirmation:confirmation
+get_input_username()
+{
+unset user
+server="$1"
+if [ ${server} == "ENIQ" ] || [ ${server} == "OMBS" ]; then
+      if [ ${server} == "ENIQ" ]; then
+         usr_msg="Enter username of the ENIQ server:"
+      fi
+      if [ ${server} == "OMBS" ]; then
+         usr_msg="Enter username of the OMBS server:"
+      fi
+fi
+while :; do
+    $ECHO "\n${usr_msg}"
+    read user
+    # Did user enter anything
+    if [ ! "${user}" ]; then
+        continue
+    fi
+    break
+done
+export user
+}
+
+
+
+### Function: get_user_input ###
+#
+# This function will collect
+# all the required ENIQ inputs
+# from user
+#
+# Arguments:
+#          None
+# Return Values:
+#       :Return values from commands
+get_user_input()
+{
+
+while :; do
+    #Getting confirmation on if deployment is Co-deployed setup with ENM
+    get_user_confirmation_input "ENIQ"
+    codeployed_confirmation=${confirmation}
+    if [ ${codeployed_confirmation} == "Y" ]; then
+        err_msg="Server is codeloyed with ENM"
+        abort_script "$err_msg" 
+    fi
+        
+    #Get server ip from user
+    get_input_ip "ENIQ"
+    ip=${ip_address}
+      
+    #Get server hostname from user
+    get_host_name 
+    host=${host_name}
+        
+    #Get username of the server
+    get_input_username "ENIQ"
+    username=$user
+    
+    while :; do
+        $ECHO "\nEnter Password of ENIQ server:"
+        read -s passd
+        cmd_1="ssh -o StrictHostKeyChecking=no ${user}\@${ip}"
+expect <<EOF > /var/tmp/san_type
+spawn ${cmd_1} "cat /eniq/installation/config/san_details"
+sleep 7
+expect {
+"* password: " {send "${passd}\r";exp_continue}
+"ERROR" {send_user "\nERROR!!!\n"; exit 1}
+sleep 60
+timeout {send_user "\nTIMEOUT!\n"; exit 9}
+}
+
+EOF
+        _san_value_=$($CAT /var/tmp/san_type | $GREP "unity")
+        if [ -z "$_san_value_" ]; then
+            $ECHO "\nWARNING:Enter Password is not correct"
+            continue
+        else
+            passwd_enc=`$ECHO $passd | openssl enc -aes-256-ctr -md sha512 -a -salt -pass pass:password`
+            ENIQ_password_key="password"
+            _san_type_=$($CAT /var/tmp/san_type | $GREP -w "SAN_DEVICE" | $AWK -F "=" '{print $2}' | $TR -d '\r')
+            if [ -z "$_san_type_" ]; then
+                err_msg="Could not fetch SAN type for ENIQ server"
+                abort_script "$err_msg"
+            fi
+            break
+        fi
+    done 
+     
+    #Adding hostname and ip of the ENIQ server to /etc/hosts file
+    $ECHO $ip $host >> /etc/hosts
+    
+    get_user_confirmation_input "OMBS"
+    OMBS_connected=${confirmation}
+        
+    if [ "${OMBS_connected}" == "Y" ]; then
+        get_user_confirmation_input "OMBS_policy"
+        disable_OMBS_policy=${confirmation}
+        if [ "${OMBS_connected}" == "Y" ] && [ "${disable_OMBS_policy}" == "Y" ]; then
+            #Get OMBS-backup hostnames
+            while :; do
+                $ECHO "\nEnter ENIQ backup hostname [In case of Multiplex rack server enter 4 hostname with space seperated list eg: ieatrcxb8199 ieatrcxb8200]:"
+                read eniq_backup_host
+                count_eniq_bckup_host=`$ECHO ${eniq_backup_host} | $TR ' ' '\n'| $WC -l`
+                if [ ${count_eniq_bckup_host} == 4 ]; then
+                    break
+                else
+                    continue
+                fi
+            done
+            #Get OMBS server ip
+            get_input_ip "OMBS"
+            ombs_ip=${ip_address}
+            
+            #Get username of the server
+            get_input_username "OMBS"
+            ombs_username=${user}
+        
+            $ECHO "\nEnter Password of OMBS server:"
+            read -s ombs_passd
+            ombs_passwd_enc=`$ECHO $ombs_passd | openssl enc -aes-256-ctr -md sha512 -a -salt -pass pass:ombs`
+            ombs_password_key="ombs"
+        fi
+    fi
+
+    get_user_confirmation_input "expansion_continue"
+    expansion_continue=${confirmation}
+
+    #Writing all the inputs to config file
+    $ECHO "[User_Information_ENIQ]" > ${CONFIG_FILE}
+    $ECHO "ENIQ-ENM Codeployed ::"${codeployed_confirmation} >>${CONFIG_FILE}
+    $ECHO "ENIQ_hostname::"${host_name} >>${CONFIG_FILE}
+    $ECHO "ENIQ_username::"${username} >>${CONFIG_FILE}
+    $ECHO "ENIQ_password::"${passwd_enc} >>${CONFIG_FILE}
+    $ECHO "ENIQ_password_key::"${ENIQ_password_key} >>${CONFIG_FILE}
+    $ECHO "Continue Expansion::"${expansion_continue} >>${CONFIG_FILE}
+    
+    $ECHO "\n[User_Information_OMBS]" >> ${CONFIG_FILE}
+    if [ "${OMBS_connected}" == "N" ]; then
+         disable_OMBS_policy=N
+    fi
+    $ECHO "ENIQ_connected_to_OMBS::"${OMBS_connected} >>${CONFIG_FILE}
+    $ECHO "Disable_OMBS_Policy::"${disable_OMBS_policy} >>${CONFIG_FILE}
+    if [ "${OMBS_connected}" == "Y" ] && [ "${disable_OMBS_policy}" == "Y" ]; then
+        $ECHO "ENIQ_backup_host::"${eniq_backup_host} >>${CONFIG_FILE}
+        $ECHO "OMBS_IP::"${ombs_ip} >>${CONFIG_FILE}
+        $ECHO "OMBS_username::"${ombs_username} >>${CONFIG_FILE}
+        $ECHO "OMBS_password::"${ombs_passwd_enc} >>${CONFIG_FILE}
+        $ECHO "OMBS_password_key::"${ombs_password_key} >>${CONFIG_FILE}
+        
+    fi
+    if [ -s /opt/ericsson/san/bin/StorageExpansion.py ]; then
+            $ECHO "\n"
+            $PYTHON /opt/ericsson/san/bin/StorageExpansion.py --input
+            result=$?
+            if [ $result -ne 0 ]; then
+                err_msg="Could not run /opt/ericsson/san/bin/StorageExpansion.py "
+                abort_script "$err_msg"
+            fi
+    else
+            err_msg="Script /opt/ericsson/san/bin/StorageExpansion.py does not exists"
+            abort_script "$err_msg"
+    fi
+    if [ -s ${CONFIG_FILE} ]; then
+        # Displaying data to user
+        $CLEAR
+        $ECHO "\n"
+        $ECHO "\nPlease find the provided inputs:"
+        $ECHO "\n"
+        $CAT ${CONFIG_FILE} | $GREP -v "password"
+        if [ -s /var/tmp/input_file2.txt ]; then
+           $ECHO "\nEntered ${_san_type_} IP Address is: `$SED -n '1p' /var/tmp/input_file2.txt`"
+        fi
+        if [ -s ${target_file} ]; then
+           $ECHO "Selecetd Configuration is: `$CAT ${target_file}`"
+        fi
+        if [ -s /var/tmp/input_file3.txt ]; then
+            $ECHO "\nAvailable Hosts to add LUNs:"
+            $ECHO "Coordinator: `$SED -n '1p' /var/tmp/input_file3.txt`"
+            $ECHO "Engine     : `$SED -n '3p' /var/tmp/input_file3.txt`"
+            $ECHO "Reader1    : `$SED -n '5p' /var/tmp/input_file3.txt`"
+            $ECHO "Reader2    : `$SED -n '7p' /var/tmp/input_file3.txt`"
+        fi
+        if [ -s /var/tmp/input_file2.txt ]; then
+            $ECHO "\nPrefix of MainDB name: `$SED -n '11p' /var/tmp/input_file2.txt`"
+            $ECHO "Prefix of TempDB name: `$SED -n '12p' /var/tmp/input_file2.txt`"
+        fi
+        user_confirm
+        if [ "${_response_}" == "NO" ]; then
+            $ECHO  "\nENIQ details will be asked again as user selected NOT to proceed." 
+            $CLEAR
+            continue
+        elif [ "${_response_}" == "QUIT" ]; then
+            $ECHO  "\nAborting the execution as selected Quit." 
+            $RM -rf /var/tmp/input_file1.txt
+            $RM -rf /var/tmp/input_file2.txt
+            $RM -rf /var/tmp/input_file3.txt
+            $RM -rf /var/tmp/target_conf.txt
+            $RM -rf /var/tmp/pid_of_expansion_process
+            exit 1
+        else 
+            $ECHO  "\nSaving the ENIQ Configurartion details ..." 
+        fi
+    fi
+    break
+done
+}
+
+
+### Function: get_expansion_inputs ###
+#
+# This function will collect
+# all the required ENIQ as well as
+# infra inputs
+# from user
+#
+# Arguments:
+#          None
+# Return Values:
+#       :Return values from commands
+get_expansion_inputs()
+{
+CONFIG_FILE="/var/tmp/input_file1.txt"
+input_file2="/var/tmp/input_file2.txt"
+input_file3="/var/tmp/input_file3.txt"
+target_file="/var/tmp/target_conf.txt"
+
+insert_header_footer head "Entering expansion stage - ${NEXT_STAGE}" ${LOGFILE}
+
+#Checking if ENIQ input file [ input_file1.txt] already exists
+while :; do
+    if [ -s ${CONFIG_FILE} ] && [ -s ${target_file} ] && [ -s ${input_file2} ] && [ -s ${input_file3} ]; then
+        $ECHO "\nFetching User Input details"
+        $ECHO "\nPlease find the provided inputs:"
+        $CAT ${CONFIG_FILE} | $GREP -v "password"
+        $ECHO "Selecetd Configuration is: `$CAT ${target_file}`"
+        $ECHO "\nEntered ${_san_type_} IP Address is: `$SED -n '1p' ${input_file2}`"
+        $ECHO "\nPrefix of MainDB name: `$SED -n '11p' ${input_file2}`"
+        $ECHO "Prefix of TempDB name: `$SED -n '12p' ${input_file2}`"
+        $ECHO "\nAvailable Hosts to add LUNs:"
+        $ECHO "Coordinator: `$SED -n '1p' ${input_file3}`"
+        $ECHO "Engine     : `$SED -n '3p' ${input_file3}`"
+        $ECHO "Reader1    : `$SED -n '5p' ${input_file3}`"
+        $ECHO "Reader2    : `$SED -n '7p' ${input_file3}`"
+        user_confirm
+        if [ "${_response_}" == "NO" ]; then
+                #Get All the required user input
+                get_user_input
+                #get_storage_input
+                break
+        elif [ "${_response_}" == "QUIT" ]; then
+            $ECHO  "\nAborting the execution as selected Quit." 
+            $RM -rf /var/tmp/input_file1.txt
+            $RM -rf /var/tmp/input_file2.txt
+            $RM -rf /var/tmp/input_file3.txt
+            $RM -rf /var/tmp/target_conf.txt
+            $RM -rf /var/tmp/pid_of_expansion_process
+            exit 1
+        elif [ "${_response_}" == "YES" ]; then
+                $ECHO "Proceeding with the above details"
+                break
+        fi
+    else
+             #Get All the required user input
+              get_user_input
+              #get_storage_input
+              break
+    fi
+done 
+
+
+$ECHO $CONFIG_FILE > /var/tmp/file_list.txt
+$ECHO $target_file >> /var/tmp/file_list.txt
+
+insert_header_footer foot "Successfully completed - ${NEXT_STAGE}." ${LOGFILE}
+set_next_stage "`$EXPR "${ARRAY_ELEM}"+1`"
+}
+
+
+
+### Function: ssh_setup ###
+#
+#Runs a command on a remote sever and returns the return value from the command
+#
+# Arguments:
+#   NONE
+# Return Values:
+# 
+setup_ssh_connectivity()
+{
+insert_header_footer head "Entering expansion stage - ${NEXT_STAGE}" ${LOGFILE}
+hostname=`$CAT ${CONFIG_FILE} | $GREP -i ENIQ_hostname | $AWK -F "::" '{print $2}'`
+if [ -z ${ip} ]; then
+    _err_msg_="Could not find ip from $CONFIG_FILE"
+    abort_script "$_err_msg_" 
+fi
+username=`$CAT ${CONFIG_FILE} | $GREP -i ENIQ_username | $AWK -F "::" '{print $2}'`
+if [ -z ${username} ]; then
+    _err_msg_="Could not find username from $CONFIG_FILE"
+    abort_script "$_err_msg_" 
+fi
+
+key=`$CAT ${CONFIG_FILE} | $GREP -w ENIQ_password_key | $AWK -F "::" '{print $2}'`
+if [ -z ${key} ]; then
+    _err_msg_="Could not find key from $CONFIG_FILE"
+    abort_script "$_err_msg_" 
+fi
+passd=`$CAT ${CONFIG_FILE} | $GREP -w ENIQ_password | $AWK -F "::" '{print $2}' | openssl enc -aes-256-ctr -md sha512 -a -d -salt -pass pass:$key`
+if [ -z ${passd} ]; then
+    _err_msg_="Could not get password from $CONFIG_FILE"
+    abort_script "$_err_msg_" 
+fi
+
+if [ ! -s "/root/.ssh/id_rsa" ] && [ ! -s "/root/.ssh/id_rsa.pub" ]; then
+SSH_create_LOGFILE=/var/tmp/ssh_keygen
+$EXPECT <<EOF >${SSH_create_LOGFILE} 2>&1
+set timeout 40
+spawn su root -c "ssh-keygen -t rsa"
+expect {
+"Enter file in which to save the key" {send -- "\r";exp_continue}
+"Enter passphrase" {send -- "\r";exp_continue}
+"Enter same passphrase again" {send -- "\r";exp_continue}
+timeout {send user "\nTIMEOUT\n"; exit 9}
+}
+expect eof
+EOF
+fi
+
+$ECHO "\nCopying SSH keys to server ip $ip .."
+#>/root/.ssh/known_hosts
+cp /dev/null /root/.ssh/known_hosts
+ssh_setup ${host_name} ${username} ${passd}
+$ECHO "Successfully copied keys to server $host_name "
+
+#Fetching ip_type from ipmp.ini from ENIQ server
+IPv6_Enable=$($RUN_REM_CMD -f $username@$host_name "source /eniq/installation/core_install/lib/common_functions.lib; iniget IPMP_INTF_1 -f /eniq/installation/config/ipmp.ini -v IPv6_Enable") >>/dev/null 2>&1
+if [ ${IPv6_Enable} == "Y" ]; then
+  _ip_type_=IPv6
+elif [ ${IPv6_Enable} == "N" ]; then
+  _ip_type_=IPv4
+else
+  _err_msg_="Could not read parameter IPv6_Enable from file ${ENIQ_CONF_DIR}/${IPMP_INI}"
+  abort_script "$_err_msg_"
+fi
+if [ ! "${_ip_type_}" ]; then
+    _err_msg_="Could not read parameter IPv6_Enable from file ${ENIQ_CONF_DIR}/${IPMP_INI}"
+    abort_script "$_err_msg_"
+fi
+
+
+$RUN_REM_CMD -f $username@$host_name  "perl /eniq/installation/core_install/lib/get_ip_order.pl -f /var/tmp/server_list.txt" >/dev/null 2>&1
+#run_remote_cmd "${ip}" "perl /eniq/installation/core_install/lib/get_ip_order.pl -f /var/tmp/server_list.txt" 
+if [ $? -ne 0 ]; then
+       _err_msg_="Error running script /eniq/installation/core_install/lib/get_ip_order.pl on server $ip" 
+       abort_script "$_err_msg_" 
+fi 
+#$RUN_REM_CMD -f $username@$ip "$CAT /var/tmp/server_list.txt" > /var/tmp/server_list.txt >/dev/null 2>&1
+if [ "${_ip_type_}" == "IPv6" ]; then
+    $SCP -6 $username@[$host_name]:/var/tmp/server_list.txt /var/tmp/server_list.txt >/dev/null 2>&1
+    if [ $? -ne 0 ]; then
+           _err_msg_="Could not read file /var/tmp/server_list.txt from server ip $ip"
+           abort_script "$_err_msg_" 
+    fi 
+else
+    $SCP $username@$host_name:/var/tmp/server_list.txt /var/tmp/server_list.txt >/dev/null 2>&1
+    if [ $? -ne 0 ]; then
+           _err_msg_="Could not read file /var/tmp/server_list.txt from server ip $ip"
+           abort_script "$_err_msg_" 
+    fi 
+
+fi 
+
+
+for entry in `$CAT /var/tmp/server_list.txt | $GREP -v "coordinator"` ; do
+   local _count_
+   _count_=`$ECHO ${entry} |grep -o "::" | wc -l`
+    if [ "${_ip_type_}" == "IPv6" ] && [ "${_count_}" == 3 ]; then
+       host=`$ECHO $entry | $AWK -F "::" '{print $3}'`
+       if [ -z ${host} ]; then
+            _err_msg_="Could not read host from /var/tmp/server_list.txt"
+            abort_script "$_err_msg_" 
+       fi
+	   
+       server_ip=`$ECHO ${entry}| $GREP -oE '([a-fA-F0-9]{1,4}::?){1,7}[a-fA-F0-9]{1,4}' | $HEAD -n 1 | $AWK -F "::" '{ print $1 "::" $2}'`
+       if [ -z ${server_ip} ]; then
+           _err_msg_="Could not read ip from /var/tmp/server_list.txt"
+           abort_script "$_err_msg_" 
+       fi
+    else
+       host=`$ECHO $entry | $AWK -F "::" '{print $2}'`
+       if [ -z ${host} ]; then
+           _err_msg_="Could not read host from /var/tmp/server_list.txt"
+           abort_script "$_err_msg_" 
+       fi
+           server_ip=`$ECHO $entry | $AWK -F "::" '{print $1}'`
+       if [ -z ${server_ip} ]; then
+           _err_msg_="Could not read ip from /var/tmp/server_list.txt"
+           abort_script "$_err_msg_" 
+       fi
+    fi
+   $ECHO "\nCopying SSH keys to server ip $host.." | $TEE -a ${LOGFILE}
+   ssh_setup ${host} ${username} ${passd}
+   $ECHO "Successfully copied keys to server ip $server_ip" | $TEE -a ${LOGFILE}
+done
+
+
+#Copyng files from MWS to ENIQ server
+copy_files_to_ENIQ
+
+insert_header_footer foot "Successfully completed - ${NEXT_STAGE}." ${LOGFILE}
+set_next_stage "`$EXPR "${ARRAY_ELEM}"+1`"
+}
+
+
+### Function: storage_expansion ###
+#
+#Perform storage expansion by using
+#Infra's script
+#
+# Arguments:
+#    NONE
+# Return Values:
+# 
+storage_expansion()
+{
+insert_header_footer head "Entering expansion stage - ${NEXT_STAGE}" ${LOGFILE}
+before=$($SED -n '4p' /var/tmp/input_file2.txt)
+after=$($SED -n '5p' /var/tmp/input_file2.txt)
+local ip
+ip=`$CAT $CONFIG_FILE | $GREP -i "ENIQ_IP" | $AWK -F "::" '{print $2}'`
+if [ -z ${ip} ]; then
+                _err_msg_="Could not find server ip from /var/tmp/server_list.txt"
+                abort_script "$_err_msg_"
+fi
+local hostname
+hostname=`$CAT $CONFIG_FILE | $GREP -i "ENIQ_hostname" | $AWK -F "::" '{print $2}'`
+if [ -z ${hostname} ]; then
+                _err_msg_="Could not find hostname from /var/tmp/server_list.txt"
+                abort_script "$_err_msg_"
+fi
+username=`$CAT ${CONFIG_FILE} | $GREP -i ENIQ_username | $AWK -F "::" '{print $2}'`
+if [ -z ${username} ]; then
+                _err_msg_="Could not find username from $CONFIG_FILE"
+                abort_script "$_err_msg_"
+fi
+$ECHO "\nDisabling rolling snapshot service on ENIQ server" | $TEE -a "${LOGFILE}"
+if [ ${username} == "root" ]; then
+    run_remote_cmd "$hostname" "bash /eniq/admin/bin/manage_deployment_services.bsh -a stop -s roll-snap -N"
+    if [ $? -eq 0 ]; then
+      $ECHO "\nSuccessfully disabled rolling snapshot service on ENIQ server" | $TEE -a "${LOGFILE}"
+        else
+      _err_msg_="Error running /eniq/admin/bin/manage_deployment_services.bsh on $ip"
+      abort_script "$_err_msg_"
+    fi
+else
+    run_remote_cmd "$hostname" "sudo bash /eniq/admin/bin/manage_deployment_services.bsh -a stop -s roll-snap -N" "$LOGFILE" "$username"
+    if [ $? -eq 0 ]; then
+      $ECHO "\nSuccessfully disabled rolling snapshot service on ENIQ server" | $TEE -a "${LOGFILE}"
+    else
+      _err_msg_="Could not execute /eniq/admin/bin/manage_deployment_services.bsh on $ip"
+          abort_script "$_err_msg_"
+    fi
+fi
+if [ ! -f "/var/tmp/storage_expansion_completed" ]; then
+    $ECHO "\nStarting Storage Expansion from Config-${before} to Config-${after}" | $TEE -a ${LOGFILE}
+    if [ -s /opt/ericsson/san/bin/StorageExpansion.py ]; then
+        $PYTHON /opt/ericsson/san/bin/StorageExpansion.py --expand
+        local result
+        result=`echo "$?"`
+        if [ $result -ne 0 ]; then
+            err_msg="Error running /opt/ericsson/san/bin/StorageExpansion.py "
+            abort_script "$err_msg"
+        else
+                $ECHO "\nSuccessfully Completed Storage Expansion" | $TEE -a ${LOGFILE}
+                touch /var/tmp/storage_expansion_completed
+        fi
+    else
+        err_msg="Script /opt/ericsson/san/bin/StorageExpansion.py does not exists"
+        abort_script "$err_msg"
+    fi
+else
+    $ECHO "\nStorage Expansion Completed already" | $TEE -a ${LOGFILE}
+fi
+
+flag_continue=`$CAT ${CONFIG_FILE} | $GREP -i "Continue Expansion" | $AWK -F "::" '{print $2}'`
+if [[ "$flag_continue" == "N" ]]; then
+    $ECHO "\nUser selected No for continuing ENIQ Database Expansion, hence exiting the execution." | $TEE -a ${LOGFILE}
+    $ECHO "\nFor more details, please refer the ENIQ Expansion Document " | $TEE -a ${LOGFILE}
+    insert_header_footer foot "Successfully completed - ${NEXT_STAGE}." ${LOGFILE}
+    set_next_stage "`$EXPR "${ARRAY_ELEM}"+1`"
+    exit 1
+fi
+
+ insert_header_footer foot "Successfully completed - ${NEXT_STAGE}." ${LOGFILE}
+ set_next_stage "`$EXPR "${ARRAY_ELEM}"+1`"
+}
+
+
+### Function: Reboot_ENIQ ###
+#
+# Perform DRACUT and reboot commands
+# on ENIQ server.
+#
+# Arguments:
+#   NONE
+# Return Values:
+# 
+Reboot_ENIQ()
+{
+insert_header_footer head "Entering expansion stage - ${NEXT_STAGE}" ${LOGFILE}
+if [ $_ip_type_ == "IPv4" ]; then
+    PING="/usr/bin/ping"
+fi
+if [ $_ip_type_ == "IPv6" ]; then
+    PING="/usr/bin/ping6"
+fi
+if [ ! -f "/var/tmp/_precheck_done" ]; then 
+    #Execute the prechecks
+    pre_checks
+fi
+
+username=`$CAT ${CONFIG_FILE} | $GREP -i ENIQ_username | $AWK -F "::" '{print $2}'`
+if [ -z ${username} ]; then
+    _err_msg_="Could not find username from $CONFIG_FILE"
+    abort_script "$_err_msg_" 
+fi
+hostname=`$CAT $CONFIG_FILE | $GREP -i "ENIQ_hostname" | $AWK -F "::" '{print $2}'`
+if [ -z ${hostname} ]; then
+                _err_msg_="Could not find server name from /var/tmp/server_list.txt"
+                abort_script "$_err_msg_"
+fi
+$ECHO "\nDisabling Services on ENIQ server" | $TEE -a "${LOGFILE}"
+if [ ${username} == "root" ]; then
+    run_remote_cmd "$hostname" "bash /eniq/admin/bin/manage_deployment_services.bsh -a stop -s ALL -N"
+    if [ $? -eq 0 ]; then
+        $ECHO "\nSuccessfully disabled services on ENIQ server" | $TEE -a "${LOGFILE}"
+    else
+        _err_msg_="Error running /eniq/admin/bin/manage_deployment_services.bsh on $ip"
+            abort_script "$_err_msg_"
+    fi
+else
+    run_remote_cmd "$hostname" "sudo bash /eniq/admin/bin/manage_deployment_services.bsh -a stop -s ALL -N" "$LOGFILE" "$username"
+    if [ $? -eq 0 ]; then
+        $ECHO "\nSuccessfully disabled services on ENIQ server" | $TEE -a "${LOGFILE}"
+    else
+    _err_msg_="Error running /eniq/admin/bin/manage_deployment_services.bsh on $ip"
+        abort_script "$_err_msg_"
+        fi
+fi
+if [ ! -s /var/tmp/reboot_eniq_completed ]; then 
+    if [ -s /var/tmp/server_list.txt ]; then
+        for entry in `$CAT /var/tmp/server_list.txt | $GREP -v "stats_engine"`; do
+            local _count_
+            _count_=`$ECHO ${entry} |grep -o "::" | wc -l`
+            if [ "${_ip_type_}" == "IPv6" ] && [ "${_count_}" == 3 ]; then
+                server_ip=`$ECHO $entry | $GREP -oE '([a-fA-F0-9]{1,4}::?){1,7}[a-fA-F0-9]{1,4}' | $HEAD -n 1 | $AWK -F "::" '{ print $1 "::" $2}'`
+                if [ -z ${server_ip} ]; then
+                    _err_msg_="Could not find server ip from /var/tmp/server_list.txt"
+                    abort_script "$_err_msg_" 
+                fi
+                local hostname
+                hostname=`$ECHO $entry | awk -F "::" '{print $3}'`
+                if [ -z ${hostname} ]; then
+                    _err_msg_="Could not find hostname from /var/tmp/server_list.txt"
+                    abort_script "$_err_msg_" 
+                fi
+            else
+                local server_ip
+                server_ip=`$ECHO $entry | awk -F "::" '{print $1}'`
+                if [ -z ${server_ip} ]; then
+                    _err_msg_="Could not find server ip from /var/tmp/server_list.txt"
+                    abort_script "$_err_msg_" 
+                fi
+                local hostname
+                hostname=`$ECHO $entry | awk -F "::" '{print $2}'`
+                if [ -z ${hostname} ]; then
+                    _err_msg_="Could not find hostname from /var/tmp/server_list.txt"
+                    abort_script "$_err_msg_" 
+                fi
+            fi
+            $ECHO "\nExecuting DRACUT command on $hostname" | $TEE -a ${LOGFILE}
+            if [ $username == "root" ]; then
+                run_remote_cmd "${hostname}" "$DRACUT --force --add multipath --include /etc/multipath"
+                $SLEEP 70
+                #rebooting each blades
+                _trigger_reboot_=0
+                $ECHO "Executing Reboot command on $hostname" | $TEE -a ${LOGFILE}
+                run_remote_cmd "${hostname}" "init 6" >/dev/null 2>&1
+                ((_trigger_reboot_="${_trigger_reboot_}" + 1 ))
+                $SLEEP 90
+                $PING -c 4 "${server_ip}" >>/dev/null 2>&1
+                if [ $? -eq 0 ]; then
+                    $ECHO "Reboot was not initiated so re-intiating for ${hostname}" | $TEE -a ${LOGFILE}
+                    run_remote_cmd "${hostname}" "init 6" >/dev/null 2>&1
+                    ((_trigger_reboot_="${_trigger_reboot_}" + 1 ))
+                    $SLEEP 40
+                    $PING -c 4 "${server_ip}" >>/dev/null 2>&1
+                    if [ $? -eq 0 ]; then
+                        $ECHO ${server_ip} >> /var/tmp/reboot_nt_initiated
+                        $ECHO "WARNING: Reboot was not initiated..... Reboot the ${hostname} server manually." | $TEE -a ${LOGFILE}
+                        ((_trigger_reboot_="${_trigger_reboot_}" + 1 ))
+                        
+                    fi
+                fi
+            else
+                $RUN_REM_CMD -f $username@$hostname  "$SUDO $DRACUT --force --add multipath --include /etc/multipath" >/dev/null 2>&1
+                $SLEEP 70
+                #rebooting each blades
+                $ECHO "The server ${hostname} had started reboot..... Please wait......" | $TEE -a ${LOGFILE}
+                _trigger_reboot_=0
+                $RUN_REM_CMD -f $username@$hostname  "$SUDO init 6" >/dev/null 2>&1
+                ((_trigger_reboot_="${_trigger_reboot_}" + 1 ))
+                $SLEEP 90
+                $PING -c 4 "${server_ip}" >>/dev/null 2>&1
+                if [ $? -eq 0 ]; then
+                    $ECHO "Reboot was not initiated so re-intiating for ${hostname}" | $TEE -a ${LOGFILE}
+                    $RUN_REM_CMD -f $username@$hostname  "$SUDO init 6" >/dev/null 2>&1
+                    ((_trigger_reboot_="${_trigger_reboot_}" + 1 ))
+                    $SLEEP 40
+                    $PING -c 4 "${server_ip}" >>/dev/null 2>&1
+                    if [ $? -eq 0 ]; then
+                        $ECHO ${server_ip} >> /var/tmp/reboot_nt_initiated
+                        $ECHO "WARNING: Reboot was not initiated..... Reboot the ${hostname} server manually." | $TEE -a ${LOGFILE}
+                        ((_trigger_reboot_="${_trigger_reboot_}" + 1 ))
+                        
+                    fi
+                fi
+            fi
+        done
+        for entry in `$CAT /var/tmp/server_list.txt | $GREP -v "stats_engine"`; do
+            local _count_
+            _count_=`$ECHO ${entry} |grep -o "::" | wc -l`
+            if [ "${_ip_type_}" == "IPv6" ] && [ "${_count_}" == 3 ]; then
+                server_ip=`$ECHO $entry | $GREP -oE '([a-fA-F0-9]{1,4}::?){1,7}[a-fA-F0-9]{1,4}' | $HEAD -n 1 | $AWK -F "::" '{ print $1 "::" $2}'`
+                if [ -z ${server_ip} ]; then
+                    _err_msg_="Could not find server ip from /var/tmp/server_list.txt"
+                    abort_script "$_err_msg_" 
+                fi
+                local hostname
+                hostname=`$ECHO $entry | awk -F "::" '{print $3}'`
+                if [ -z ${hostname} ]; then
+                    _err_msg_="Could not find hostname from /var/tmp/server_list.txt"
+                    abort_script "$_err_msg_" 
+                fi
+            else
+                local server_ip
+                server_ip=`$ECHO $entry | awk -F "::" '{print $1}'`
+                if [ -z ${server_ip} ]; then
+                    _err_msg_="Could not find server ip from /var/tmp/server_list.txt"
+                    abort_script "$_err_msg_" 
+                fi
+                local hostname
+                hostname=`$ECHO $entry | awk -F "::" '{print $2}'`
+                if [ -z ${hostname} ]; then
+                    _err_msg_="Could not find hostname from /var/tmp/server_list.txt"
+                    abort_script "$_err_msg_" 
+                fi
+            fi
+            _timeout_=0
+            while [ "${_timeout_}" -lt 20 ]; do
+                $PING -c 1 "${server_ip}" >>/dev/null 2>&1
+                if [ $? -ne 0 ]; then
+                    $ECHO "${server_ip} Server reboot still in progress, Please wait for some more time...." | $TEE -a ${LOGFILE}
+                    (( _timeout_ = "${_timeout_}" + 1 ))
+                    $SLEEP 30
+                    continue
+                elif [ "${_trigger_reboot_}" -eq 9 ]; then
+                    $ECHO ${server_ip} >> /var/tmp/reboot_nt_succ
+                    $ECHO "Reboot not successful..... Check the ${server_ip} server manually." | $TEE -a ${LOGFILE}
+                    break
+                else
+                    $ECHO "\n${server_ip} server rebooted successfully." | $TEE -a ${LOGFILE}
+                    _timeout_=21
+                fi
+            done
+        
+            if [ "${_timeout_}" == 20 ]; then
+                $ECHO ${server_ip} >> /var/tmp/max_rbt_timout
+                $ECHO "Max Timeout has reached for reboot on the ${server_ip} server. Kindly check the state of server and try to check with \"last reboot\" command" | $TEE -a ${LOGFILE}
+            fi
+        done
+    fi
+    
+    hostname=`$CAT $CONFIG_FILE | $GREP -i "ENIQ_hostname" | $AWK -F "::" '{print $2}'`
+    if [ -z ${hostname} ]; then
+                    _err_msg_="Could not find server hostname from /var/tmp/server_list.txt"
+                    abort_script "$_err_msg_"
+    fi
+    if [[ -s /var/tmp/reboot_nt_initiated || -s /var/tmp/reboot_nt_succ || -s /var/tmp/max_rbt_timout ]]; then
+        if [ -s /var/tmp/reboot_nt_initiated ]; then
+            $ECHO "Reboot was not initiated on below server, perform manual reboot:" | $TEE -a "${LOGFILE}"
+            $CAT /var/tmp/reboot_nt_initiated
+        fi
+        if [[ -s /var/tmp/reboot_nt_succ || -s /var/tmp/max_rbt_timout ]]; then
+            $ECHO "Reboot was not successful on below server, perform verify manually:" | $TEE -a "${LOGFILE}"
+            $CAT /var/tmp/reboot_nt_succ
+        fi
+        _err_msg_="Failed for rebooting te server"
+        abort_script "$_err_msg_" 
+    fi
+    if [[ ! -s /var/tmp/reboot_nt_initiated && ! -s /var/tmp/reboot_nt_succ && ! -s /var/tmp/max_rbt_timout ]]; then
+        touch /var/tmp/reboot_eniq_completed
+    fi
+else 
+    $ECHO "\nReboot on ENIQ already completed" | $TEE -a "${LOGFILE}"
+fi
+$ECHO "\nEnabling Services on ENIQ server" | $TEE -a "${LOGFILE}"
+if [ ${username} == "root" ]; then
+    run_remote_cmd "$hostname" "bash /eniq/admin/bin/manage_deployment_services.bsh -a start -s ALL -N"
+    if [ $? -eq 0 ]; then
+        $ECHO "\nSuccessfully enabled services on ENIQ server" | $TEE -a "${LOGFILE}"
+    else
+        _err_msg_="Error running /eniq/admin/bin/manage_deployment_services.bsh on $hostname"
+            abort_script "$_err_msg_"
+    fi
+else
+    run_remote_cmd "$hostname" "sudo bash /eniq/admin/bin/manage_deployment_services.bsh -a start -s ALL -N" "$LOGFILE" "$username"
+    if [ $? -eq 0 ]; then
+        $ECHO "\nSuccessfully enabled services on ENIQ server" | $TEE -a "${LOGFILE}"
+    else
+    _err_msg_="Error running /eniq/admin/bin/manage_deployment_services.bsh on $hostname"
+        abort_script "$_err_msg_"
+        fi
+fi
+
+insert_header_footer foot "Successfully completed - ${NEXT_STAGE}." ${LOGFILE}
+set_next_stage "`$EXPR "${ARRAY_ELEM}"+1`"
+}
+
+
+
+### Function: database_expansion ###
+#
+# Perform database expansion on
+# ENIQ server
+#
+# Arguments:
+#   NONE
+# Return Values:
+# 
+database_expansion()
+{
+before=$($SED -n '4p' /var/tmp/input_file2.txt)
+after=$($SED -n '5p' /var/tmp/input_file2.txt)
+
+insert_header_footer head "Entering expansion stage - ${NEXT_STAGE}" ${LOGFILE}
+local ip
+ip=`$CAT $CONFIG_FILE | $GREP -i "ENIQ_IP" | $AWK -F "::" '{print $2}'`
+if [ -z ${ip} ]; then
+     _err_msg_="Could not find ip from $CONFIG_FILE"
+     abort_script "$_err_msg_" 
+ fi
+local hostname
+hostname=`$CAT $CONFIG_FILE | $GREP -i "ENIQ_hostname" | $AWK -F "::" '{print $2}'`
+if [ -z ${hostname} ]; then
+     _err_msg_="Could not find ip from $CONFIG_FILE"
+     abort_script "$_err_msg_" 
+fi
+username=`$CAT ${CONFIG_FILE} | $GREP -i ENIQ_username | $AWK -F "::" '{print $2}'`
+ if [ -z ${username} ]; then
+     _err_msg_="Could not find username from $CONFIG_FILE"
+     abort_script "$_err_msg_" 
+ fi
+ 
+$ECHO "\nExecuting ENIQ Database Expansion script /eniq/installation/core_install/bin/eniq_db_expansion.bsh on $hostname" | $TEE -a ${LOGFILE}
+$ECHO "\nStarting ENIQ Database Expansion from Config-${before} to Config-${after}" | $TEE -a ${LOGFILE}
+if [ ${username} == "root" ]; then
+    run_remote_cmd "$hostname" "bash /eniq/installation/core_install/bin/eniq_db_expansion.bsh"
+    if [ $? -eq 0 ]; then
+        $ECHO "\nSuccessfully Completed ENIQ Database Expansion" | $TEE -a ${LOGFILE}
+    else
+        _err_msg_="Error running script /eniq/installation/core_install/bin/eniq_db_expansion.bsh"
+        abort_script "$_err_msg_"
+    fi
+else
+        #$RUN_REM_CMD -f $username@$ip  "$SUDO bash /eniq/installation/core_install/bin/eniq_db_expansion.bsh"
+            run_remote_cmd "$hostname" "sudo bash /eniq/installation/core_install/bin/eniq_db_expansion.bsh" "$LOGFILE" "$username"
+    if [ $? -eq 0 ]; then
+        $ECHO "\nSuccessfully completed database expansion" | $TEE -a ${LOGFILE}
+    else
+        _err_msg_="Error running script /eniq/installation/core_install/bin/eniq_db_expansion.bsh"
+        abort_script "$_err_msg_"
+    fi
+fi
+   
+insert_header_footer foot "Successfully completed - ${NEXT_STAGE}." ${LOGFILE}
+set_next_stage "`$EXPR "${ARRAY_ELEM}"+1`"
+}
+
+
+pre_checks()
+{
+local ip
+ip=`$CAT $CONFIG_FILE | $GREP -i "ENIQ_IP" | $AWK -F "::" '{print $2}'`
+if [ -z ${ip} ]; then
+     _err_msg_="Could not find ip from $CONFIG_FILE"
+     abort_script "$_err_msg_" 
+ fi
+local hostname
+hostname=`$CAT /var/tmp/server_list.txt | $GREP $ip | $AWK -F "::" '{print $2}'`
+if [ -z ${hostname} ]; then
+     _err_msg_="Could not find hostname from /var/tmp/server_list.txt"
+     abort_script "$_err_msg_" 
+ fi
+username=`$CAT ${CONFIG_FILE} | $GREP -i ENIQ_username | $AWK -F "::" '{print $2}'`
+ if [ -z ${username} ]; then
+     _err_msg_="Could not find username from $CONFIG_FILE"
+     abort_script "$_err_msg_" 
+ fi
+
+HEALTHCHECK_SCRIPT=/eniq/installation/core_install/eniq_checks/bin/eniq_checks.bsh
+HEALTH_SUMMARY_DIR=/eniq/log/precheck/summary
+
+ 
+$ECHO "\nExecuting ENIQ Pre-Checks on $hostname" | $TEE -a ${LOGFILE}
+$ECHO "\nNote: Please wait as it may take 5-10 minutes to complete ENIQ pre-checks" | $TEE -a "${LOGFILE}"
+if [ "${username}" == "root" ]; then
+    run_remote_cmd "$ip" "bash /eniq/installation/core_install/eniq_checks/bin/eniq_checks.bsh  >>/dev/null"
+    _precheck_exe_status_=$?
+    if [[ $_precheck_exe_status_ -ne 0 ]];then
+        _err_msg_="Pre-Checks Execution failed."
+        abort_script "$_err_msg_"
+    fi
+else
+    run_remote_cmd "$ip" "sudo bash /eniq/installation/core_install/eniq_checks/bin/eniq_checks.bsh  >>/dev/null" "$LOGFILE" "$username"
+    if [[ $_precheck_exe_status_ -ne 0 ]];then
+        _err_msg_="Pre-Checks Execution failed."
+        abort_script "$_err_msg_"
+    fi
+fi
+
+
+if [ "${username}" == "root" ]; then
+    _last_summary_file_=`run_remote_cmd "$ip" "ls -rt /eniq/log/precheck/summary | tail -1" "${LOGFILE}" root disable_tty`
+    if [ -z "{_last_summary_file_}" ]; then
+        _err_msg_="Could not find latest precheck summry file under ${HEALTH_SUMMARY_DIR}"
+        abort_script "$_err_msg_"
+    else
+        run_remote_cmd "$ip" "cat /eniq/log/precheck/summary/$_last_summary_file_" "${LOGFILE}" root disable_tty > /var/tmp/precheck
+        if [ ! -s "/var/tmp/precheck" ]; then
+           _err_msg_="Could not read latest precheck summry file under ${HEALTH_SUMMARY_DIR}"
+           abort_script "$_err_msg_"
+        fi
+    fi
+else
+    _last_summary_file_=`run_remote_cmd "$ip" "sudo ls -rt /eniq/log/precheck/summary | tail -1" "$LOGFILE" "$username" disable_tty`
+    if [ -z "{_last_summary_file_}" ]; then
+        _err_msg_="Could not find latest precheck summry file under ${HEALTH_SUMMARY_DIR}"
+        abort_script "$_err_msg_" 
+    else
+        run_remote_cmd "$ip" "sudo cat /eniq/log/precheck/summary/$_last_summary_file_" "${LOGFILE}" "$username" disable_tty > /var/tmp/precheck
+        if [ ! -s "/var/tmp/precheck" ]; then
+           _err_msg_="Could not read latest precheck summry file under ${HEALTH_SUMMARY_DIR}"
+           abort_script "$_err_msg_"
+        fi
+    fi
+fi
+
+# Check for failures in health check summary file
+failure_chk=`$CAT /var/tmp/precheck | $GREP -v "TOTAL CHECKS" | $GREP "FAILURE" | $WC -l`
+if [[ $failure_chk -gt 0 ]]; then
+    $ECHO "\nHealth Checks with FAILURE:" | $TEE -a ${LOGFILE}
+    $CAT /var/tmp/precheck | $GREP -v "TOTAL CHECKS" | $GREP "FAILURE" | $AWK -F "|" '{print $1,"\t" "REMARK:"$3 "\t" "Log:" $4}' > /var/tmp/pre_check
+    $SED 's/^ *//' /var/tmp/pre_check | cut -d" " -f2-
+fi
+
+# Check for warning in health check summary file
+warning_chk=`$CAT /var/tmp/precheck | $GREP -v "TOTAL CHECKS" | $GREP "WARNING" | $WC -l`
+if [ $warning_chk -gt 0 ]; then
+    $ECHO "\nHealth Checks with WARNING:" | $TEE -a ${LOGFILE}
+    $CAT /var/tmp/precheck | $GREP -v "TOTAL CHECKS" | $GREP "WARNING" | $AWK -F "|" '{print $1,"\t" "REMARK:"$3 "\t" "Log:" $4}' > /var/tmp/pre_check
+    $SED 's/^ *//' /var/tmp/pre_check | cut -d" " -f2-
+fi
+
+if [[ ( $failure_chk == 0 ) && ( $warning_chk -gt 0 ) ]]; then
+    $ECHO "\nDo you want to continue with current state of pre_checks? (yes/no)"
+    read pre_check_flow
+    if [[ $pre_check_flow == "no" || $pre_check_flow == "NO" || $pre_check_flow == "No" || $pre_check_flow == "n" || $pre_check_flow == "N" ]]; then
+        _err_msg_="Aborting the execution. Please resolve the warning(s) and re-run the script again. "
+        abort_script "$_err_msg_"
+    else
+        touch /var/tmp/_precheck_done
+    fi
+elif [[ ( $failure_chk == 0 ) && ( $warning_chk == 0 ) ]]; then
+    $ECHO "\nAll ENIQ pre-checks execution status is sucessfull" | $TEE -a ${LOGFILE}
+    touch /var/tmp/_precheck_done
+elif [[ $failure_chk -gt 0 ]]; then
+    _err_msg_="Aborting the execution, as failure for ENIQ pre-checks found. Resolve the issue(s) and re-run the script again. "
+    abort_script "$_err_msg_"
+fi
+}
+
+### Function: post_expansion ###
+#
+# Perform post expansion 
+# 
+#
+# Arguments:
+#   NONE
+# Return Values:
+# 
+post_expansion()
+{
+insert_header_footer head "Entering expansion stage - ${NEXT_STAGE}" ${LOGFILE}
+local ip
+before=$($SED -n '4p' /var/tmp/input_file2.txt)
+after=$($SED -n '5p' /var/tmp/input_file2.txt)
+
+
+ip=`$CAT $CONFIG_FILE | $GREP -i "ENIQ_IP" | $AWK -F "::" '{print $2}'`
+if [ -z ${ip} ]; then
+                _err_msg_="Could not find server ip from /var/tmp/server_list.txt"
+                abort_script "$_err_msg_"
+fi
+local hostname
+hostname=`$CAT $CONFIG_FILE | $GREP -i "ENIQ_hostname" | $AWK -F "::" '{print $2}'`
+if [ -z ${hostname} ]; then
+                _err_msg_="Could not find server ip from /var/tmp/server_list.txt"
+                abort_script "$_err_msg_"
+fi
+username=`$CAT ${CONFIG_FILE} | $GREP -i ENIQ_username | $AWK -F "::" '{print $2}'`
+if [ -z ${username} ]; then
+                _err_msg_="Could not find username from $CONFIG_FILE"
+                abort_script "$_err_msg_"
+fi
+
+if [ -s /opt/ericsson/san/bin/StorageExpansion.py ]; then
+    $PYTHON /opt/ericsson/san/bin/StorageExpansion.py --postconfig
+    local result
+    result=`echo "$?"`
+    if [ $result -ne 0 ]; then
+        err_msg="Error running /opt/ericsson/san/bin/StorageExpansion.py "
+        abort_script "$err_msg"
+    fi
+else
+    err_msg="Script /opt/ericsson/san/bin/StorageExpansion.py does not exists"
+    abort_script "$err_msg"
+fi
+
+$ECHO "\nEnabling rolling snapshot service on ENIQ server" | $TEE -a "${LOGFILE}"
+
+if [ ${username} == "root" ]; then
+    run_remote_cmd "$hostname" "bash /eniq/admin/bin/manage_deployment_services.bsh -a start -s roll-snap -N"
+    if [ $? -eq 0 ]; then
+      $ECHO "\nSuccessfully enabled rolling snapshot service on ENIQ server" | $TEE -a "${LOGFILE}"
+        else
+      _err_msg_="Error running /eniq/admin/bin/manage_deployment_services.bsh on $hostname"
+      abort_script "$_err_msg_"
+    fi
+else
+    run_remote_cmd "$hostname" "sudo bash /eniq/admin/bin/manage_deployment_services.bsh -a start -s roll-snap -N" "$LOGFILE" "$username"
+    if [ $? -eq 0 ]; then
+      $ECHO "\nSuccessfully enabled rolling snapshot service on ENIQ server" | $TEE -a "${LOGFILE}"
+    else
+      _err_msg_="Error running /eniq/admin/bin/manage_deployment_services.bsh on $hostname"
+          abort_script "$_err_msg_"
+    fi
+fi
+
+insert_header_footer foot "Successfully completed - ${NEXT_STAGE}." ${LOGFILE}
+set_next_stage `$EXPR "${ARRAY_ELEM}"+1`
+
+}
+
+
+### Function: run_remote_cmd ###
+#
+#Runs a command on a remote sever and returns the return value from the command
+#
+# Arguments:
+#   $1 : hostname/ip
+#   $2 : command to be ran
+#   $3 : optional logfile
+#   $4 : optional user, defaults to root
+#   $5 : disable force tty. If set to "disable_tty", disable forcing tty.
+#        Should be disabled to run a command remotely and leave it 
+#        running on the remote machine after the calling script disconnects.
+# Return Values:
+#      : Return value from the command
+
+run_remote_cmd()
+{
+if  [ "${1}" == "" ]; then
+    _err_msg_="Must provide server"
+    abort_script "$_err_msg_"
+fi
+if  [ "${2}" == "" ]; then
+    _err_msg_="Must provide next available dbfile"
+    abort_script "$_err_msg_"
+fi
+if  [ "${3}" != "" ]; then
+    local _logfile_="${3}"
+else
+    local _logfile_="/var/tmp/ping_server_status.log"
+    if [ ! -f $_logfile_ ]; then
+     $TOUCH $_logfile_    
+     # Changing permission of "$_logfile_" 
+     $CHMOD 666 "$_logfile_"
+    fi
+fi
+if  [ "${4}" != "" ]; then
+    local _user_="${4}"
+else
+    local _user_="root"
+fi
+if  [ "${5}" != "" ]; then
+    local _disable_tty_="${5}"
+else
+    local _disable_tty_=""
+fi
+    
+local _server_="${1}"
+local _cmd_="${2}"
+TS=`date "+%Y-%m-%d %H:%M:%S"`
+$ECHO $TS "Trying to ping server" $_server_ >> $_logfile_
+if [ $_ip_type_ == "IPv4" ]; then
+    PING="/usr/bin/ping"
+fi
+if [ $_ip_type_ == "IPv6" ]; then
+    PING="/usr/bin/ping6"
+fi
+$PING -c 2 $_server_ >> $_logfile_ 
+if [ $? -ne 0 ]; then
+    flag=0
+    while [ $flag -lt 3 ]
+    do
+        TS=`date "+%Y-%m-%d %H:%M:%S"`
+        $ECHO $TS "Trying to ping server" $_server_ >> $_logfile_
+        $PING -c 2 $_server_ >> $_logfile_
+            if [ $? -ne 0 ]; then
+                png=1
+            else
+                png=0
+                break
+            fi
+        flag=`$EXPR $flag + 1`
+    done
+    if [ $png -ne 0 ]; then
+    ${ECHO} "failed to ping server $_server_" | $TEE -a $_logfile_
+                    return 1
+    fi
+fi
+    
+# Default value for tty option is -t -t (unchanged):
+_tty_value="-t -t"
+if [ "${_disable_tty_}" == "disable_tty" ]; then
+    _tty_value=""
+fi
+    
+if [ "${_user_}" == "root" ] || [ "${_user_}" == "dcuser" ]; then
+    $SSH ${_tty_value} -o StrictHostKeyChecking=no -o BatchMode=yes -q $_user_@$_server_ ${_cmd_}
+    return $?
+else
+#$SUDO -u $_user_ $SSH ${_tty_value} -o StrictHostKeyChecking=no -o BatchMode=yes -q $_user_@$_server_ ${_cmd_}
+    $SSH ${_tty_value} -o StrictHostKeyChecking=no -o BatchMode=yes -q $_user_@$_server_ ${_cmd_}
+    return $?
+fi
+ 
+}
+
+
+
+### Function: insert_header_footer ###
+#
+#   Insert a stage header/footer message
+#
+# Arguments:
+#   $1 : head/foot
+#   $2 : Message
+#   $3 : Logfile
+# Return Values:
+#   none
+insert_header_footer()
+{
+if [ $# -ne 3 ]; then
+    _err_msg_="3 Parameters must be passed to header/footer function"
+    abort_script "$_err_msg_" "${EXEC_SHELL_CMD}"
+fi    
+
+_type_=$1
+_msg_=$2
+_logfile_=$3
+
+if [ "$_type_" != "head" ] && [ "$_type_" != "foot" ]; then
+    _err_msg_="Only Param of head/foot is allowed...exiting!"
+    abort_script "$_err_msg_" "${EXEC_SHELL_CMD}"
+fi    
+
+$MKDIR -p "`$DIRNAME ${_logfile_}`"
+if [ $? -ne 0 ]; then
+    _err_msg_="Could not create directory `$DIRNAME ${_logfile_}`"
+    abort_script "$_err_msg_" "${EXEC_SHELL_CMD}"
+fi    
+
+$TOUCH -a ${_logfile_}
+if [ $? -ne 0 ]; then
+    _err_msg_="Could not write to file ${_logfile_}"
+    abort_script "$_err_msg_" "${EXEC_SHELL_CMD}"
+fi
+
+_time_=`$DATE '+%Y-%b-%d_%H.%M.%S'`
+if [ "$_type_" == "head" ]; then
+    $ECHO "============================================================================" | $TEE -a ${_logfile_}
+    $ECHO "----------------------------------------------------------------------------" | $TEE -a ${_logfile_}
+    $ECHO "$_time_ : $_msg_" | $TEE -a ${_logfile_}
+    $ECHO "----------------------------------------------------------------------------" | $TEE -a ${_logfile_}
+fi
+
+if [ "$_type_" == "foot" ]; then
+    $ECHO "----------------------------------------------------------------------------" | $TEE -a ${_logfile_}
+    $ECHO "$_time_ : $_msg_" | $TEE -a ${_logfile_}
+    $ECHO "----------------------------------------------------------------------------" | $TEE -a ${_logfile_}
+    $ECHO "============================================================================" | $TEE -a ${_logfile_}
+fi
+
+}
+
+
+### Function: set_next_stage ###
+#
+# Set up the stage to be run
+#
+# Arguments:
+#   $1 : Stage to be set to. Either numeric value or 'cleanup'
+# Return Values:
+#   none
+set_next_stage()
+{
+_stage_time_=`$DATE '+%Y-%b-%d_%H.%M.%S'`
+$RM -rf ${STAGEFILE}
+$ECHO "# Setting new stage at $_stage_time_"  | $TEE -a ${LOGFILE} ${STAGEFILE} >> /dev/null 2>&1
+$ECHO "${EXP_STAGES[$1]} "  | $TEE -a ${LOGFILE} ${STAGEFILE} >> /dev/null 2>&1
+}
+
+
+
+
+### Function: check_multiple_instances ###
+#
+# Multiple instances of the same script should not run
+#
+# Arguments:
+#   none
+# Return Values:
+#   none
+check_multiple_instances()
+{
+if [ -s "/var/tmp/pid_of_expansion_process" ]; then
+    PREV_PID=`$CAT "/var/tmp/pid_of_expansion_process"`
+    if [ ! -z "${PREV_PID}" ]; then
+        $PS -eaf | $GREP "expansion_automation.bsh" | $GREP -v $GREP | $GREP "${PREV_PID}" >> /dev/null 2>&1
+        if [ $? -eq 0 ]; then
+            $ECHO "Exiting... Another instance of expansion is already in progress." | $TEE -a ${LOGFILE}
+            exit 0
+        fi
+    fi
+fi
+
+CURRENT_PID=`$ECHO $$`
+$RM -rf "/var/tmp/pid_of_expansion_process"
+$ECHO "${CURRENT_PID}" >> "/var/tmp/pid_of_expansion_process"
+}
+
+
+# ********************************************************************
+#
+#   Main body of program
+#
+# ********************************************************************
+#
+
+# Multiple instances of the same script should not run in parallel.
+check_multiple_instances
+
+
+# Determine absolute path to software
+get_absolute_path
+
+# Set up environment variables for script.
+#setup_env
+setup_env
+
+STAGEFILE=/var/tmp/continue_expansion_stage
+
+while getopts ":l:s:" arg; do
+  case $arg in
+    l) LOGFILE="$OPTARG"
+       ;;
+    s) USER_STAGE="$OPTARG"
+       ;;
+   \?) _err_msg_="`$BASENAME $0` -s <stage>"
+       abort_script "${_err_msg_}" "${EXEC_SHELL_CMD}"
+       ;;
+  esac
+done
+shift `expr $OPTIND - 1`
+
+# Log file
+if [ ! "${LOGFILE}" ]; then
+    $MKDIR -p /var/tmp/expansion
+    LOGFILE="/var/tmp/expansion/${HNAME}_expansion.log"
+fi
+
+
+if [ ! -f "${LOGFILE}" ]; then
+    $TOUCH "${LOGFILE}"
+    if [ $? -ne 0 ]; then
+        _err_msg_="Could not make log file"
+        abort_script "$_err_msg_"
+    fi
+
+    $ECHO "Changing permission of the ${LOGFILE} to 644" | $TEE -a "${LOGFILE}"
+    $CHMOD 644 "${LOGFILE}"
+    if [ $? -ne 0 ]; then
+        _err_msg_="Could not change ${LOGFILE} file permissions to 644"
+        abort_script "$_err_msg_"
+    fi
+fi
+
+
+if [ "$USER_STAGE" ]; then
+    expansion_check_user_stage ${USER_STAGE}
+    if [ $? -ne 0 ]; then
+    echo "Could not find specifc stage in stagelist" 
+    exit 1
+    fi
+fi
+
+if [ "$USER_STAGE" ]; then
+    NEXT_STAGE="${USER_STAGE}"
+    get_array_element
+else
+    get_next_stage
+fi
+
+
+
+# If we read cleanup from the stagefile
+if [ "$NEXT_STAGE" == "cleanup" ]; then
+    # Clean up as it may not be done already
+    cleanup
+    $ECHO "All Stages are already completed" 
+    exit 0
+fi
+
+while :; do
+    _nxt_stage_="${NEXT_STAGE}"
+    $_nxt_stage_
+    if [ $? -ne 0 ]; then
+        _err_msg_="Error in Stage ${NEXT_STAGE}"
+        abort_script "$_err_msg_" "${EXEC_SHELL_CMD}"
+    fi
+
+    if [ "$USER_STAGE" ]; then
+        break
+    fi
+    #If we read cleanup from the stagefile
+    if [ "$NEXT_STAGE" == "cleanup" ]; then
+        break
+    fi
+
+    get_next_stage
+done
+
+if [ -z "$USER_STAGE" ]; then  
+    $ECHO "\nENIQ Expansion from Config-${before} to Config-${after} Successfully Completed" | $TEE -a ${LOGFILE}
+fi
+exit 0
+

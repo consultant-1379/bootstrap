@@ -1,0 +1,2033 @@
+#!/bin/bash
+# ********************************************************************
+# Ericsson Radio Systems AB      SCRIPT                                    
+# ********************************************************************
+#
+# (c) Ericsson Radio Systems AB 2021 - All rights reserved.
+#
+# The copyright to the computer program(s) herein is the property
+# of Ericsson Radio Systems AB, Sweden. The programs may be used
+# and/or copied only with the written permission from Ericsson Radio
+# Systems AB or in accordance with the terms and conditions stipulated
+# in the agreement/contract under which the program(s) have been
+# supplied.
+#
+# ********************************************************************
+#
+# Name    : continue_eniq_migration.bsh
+# Date    : 09/01/2020
+# Revision: \main\22
+# Purpose : This script will be called when migration is       
+#           continued after OS installation is completed.
+#           
+# Usage   : continue_eniq_migration.bsh
+#
+# ********************************************************************
+#
+#   Command Section
+#
+# ********************************************************************
+AWK=/usr/bin/awk
+CAT=/usr/bin/cat
+CUT=/usr/bin/cut
+CP=/usr/bin/cp
+CPIO=/usr/bin/cpio
+DATE=/usr/bin/date
+DF=/usr/bin/df
+DIRNAME=/usr/bin/dirname
+DU=/usr/bin/du
+ECHO='/usr/bin/echo -e'
+EGREP=/usr/bin/egrep
+EXPECT=/usr/bin/expect
+EXPR=/usr/bin/expr
+FIND=/usr/bin/find
+GAWK=/usr/bin/gawk
+GREP=/usr/bin/grep
+GTAR=/usr/bin/gtar
+HEAD=/usr/bin/head
+MYHOSTNAME=/usr/bin/hostname
+ID=/usr/bin/id
+IFCONFIG=/usr/sbin/ifconfig
+IP=/usr/sbin/ip
+LS=/usr/bin/ls
+MKDIR=/usr/bin/mkdir
+MV=/usr/bin/mv
+NMCLI=/usr/bin/nmcli
+OPENSSL=/usr/bin/openssl
+PING=/usr/bin/ping
+PRINTF=/usr/bin/printf
+PWD=/usr/bin/pwd
+RM=/usr/bin/rm
+SED=/usr/bin/sed
+SORT=/usr/bin/sort
+STTY=/usr/bin/stty
+SYSTEMCTL=/usr/bin/systemctl
+TEE=/usr/bin/tee
+TOUCH=/usr/bin/touch
+TR=/usr/bin/tr
+WC=/usr/bin/wc
+YES=/usr/bin/yes
+ZCAT=/usr/bin/zcat
+
+# ********************************************************************
+#
+#       Configuration Section
+#
+# ********************************************************************
+# Cmd to exec a shell and drop user to it in case of an error
+EXEC_SHELL_CMD="exec /bin/bash -o emacs"
+
+# Default user
+DEFAULT_USER=root
+
+# Name of the ini Files
+SUNOS_INI=SunOS.ini
+SUNOS_INI_TEMPLATE=SunOS.ini_vnx
+
+# Config file and directory list
+CONFIG_FILE_LIST="hosts netmasks"
+
+#ENIQ standard Local logs list
+LOCAL_LOGS_LIST="migration installation iq esm hostsync rolling_snapshot_logs connectd NASd snapshot_logs eniq_services_log replacement sw_log"
+
+# Host name
+HNAME=`$MYHOSTNAME -s`
+
+# This is the name of the core installation SW bundle that resides in the ENIQ_BASE_SW directory
+ENIQ_CORE_INST_SW_BUNDLE=install/eniq_core_inst_sw_bundle.tar.gz
+
+# Var tmp directory
+VAR_TMP=/var/tmp
+
+# Migration conf directories/files
+MIG_DIR=/var/tmp/continue_migration
+USER_CONF=${MIG_DIR}/migration_input.conf
+STORAGE_TYPE=${MIG_DIR}/storage_type
+
+# ENIQ directories
+ENIQ_BASE_DIR=/eniq
+ENIQ_INST_DIR=${ENIQ_BASE_DIR}/installation
+ENIQ_CORE_INST_DIR=${ENIQ_INST_DIR}/core_install
+ENIQ_CONF_DIR=${ENIQ_INST_DIR}/config
+
+# Location of interface directory
+INTF_DIR="/etc/sysconfig/network-scripts"
+
+# Build an array to store the stage names
+LIN_MIG_STAGES=( copy_from_nas_backup
+update_merge_config_files
+initiate_migration 
+cleanup
+)
+
+# Continue migration stage file
+STAGEFILE=${MIG_DIR}/curr_stage_continue_migration
+
+
+
+# *********************
+#
+# Functions
+#
+# *********************
+
+### Function: abort_script ###
+#
+#   This will be called if the script is aborted through 
+#   error encountered during runtime
+#
+# Arguments:
+#       $1 - Error message from part of program (Not always used)
+#       $2 - EXEC_SHELL_CMD
+# Return Values:
+#       none
+abort_script()
+{
+if [ "$1" ]; then
+    _err_msg_="ERROR: $1"
+else
+    _err_msg_="ERROR: Script aborted......."
+fi
+if [ "${LOGFILE}" ]; then
+    $ECHO "\n$_err_msg_\n" |$TEE -a ${LOGFILE}
+else
+    $ECHO "\n$_err_msg_\n" 
+fi
+cd $SCRIPTHOME
+
+if [ "$2" ]; then
+    ${2} 
+else
+   exit 1
+fi
+}
+
+
+### Function: check_id ###
+#
+#   Check that the effective id of the user is correct
+#   If not print error msg and exit.
+#
+check_id()
+{
+_check_id_=`$ID  | $AWK -F\( '{print $2}' | $AWK -F\) '{print $1}'`
+if [ "$_check_id_" != "$1" ]; then
+    _err_msg_="You must be $1 to execute this script."
+    abort_script "$_err_msg_" "${EXEC_SHELL_CMD}"
+fi
+}
+
+
+### Function: check_required_scripts_files ###
+#
+# Checks for few mandatory files which
+# are required for migration to run
+#
+# Arguments:
+#       none
+# Return Values:
+#       none
+check_required_scripts_files()
+{
+# Checking Migration conf file exist or not
+if [ ! -s ${MIGRATION_CONF} ]; then
+    _err_msg_="${MIGRATION_CONF} does not exist or empty"
+    abort_script "${_err_msg_}" "${EXEC_SHELL_CMD}"
+fi
+
+# Checking Migration Script is exist or not
+if [ ! -f "${ENIQ_MIGRATION_SCRIPT}" ];then
+    _err_msg_="Migration script ${ENIQ_MIGRATION_SCRIPT} not found."
+    abort_script "${_err_msg_}" "${EXEC_SHELL_CMD}"
+fi
+
+logit -q "Required scripts and files are present on server"
+}
+
+
+### Function: cleanup ###
+#
+# Final stage. Clean up
+#
+# Arguments:
+#       none
+# Return Values:
+#       none
+cleanup()
+{
+# Remove the TEMP directory
+$RM -rf ${TEM_DIR}
+return 0
+}
+
+
+### Function: clear ###
+#
+# Clears the terminal screen
+#
+# Arguments:
+#       none
+# Return Values:
+#       none
+clear()
+{
+# Clearing the screen without removing scrollback buffer
+$PRINTF '\33[H\33[2J'
+}
+
+### Function: common_get_vlan_arp ###
+#
+# inirator question to get the highly available server IP
+#
+# Arguments:
+#   $1 : bond group name
+# Return Values:
+#   none
+#
+common_get_vlan_arp()
+{
+local _ipmp_grp_name_=$1
+
+while :; do
+    unset _ipmp_arp_value_ _invalid_ip_
+
+    $ECHO "\nEnter the IP address of at least one highly available servers in the same subnet as ${_ipmp_grp_name_}"
+    case "${_ipmp_grp_name_}" in
+        "PM Services Group") _ip_type_="MWS Server IP"
+            ;;
+        "OSSRC Group") _ip_type_="Old NAS Console IP"
+            ;;
+        "Storage Group") _ip_type_="NAS Console IP"
+            ;;
+        "Backup Group") _ip_type_="OMBS Server IP"
+            ;;
+        "ENM Group") _ip_type_="An IP of the same subnet as of ENM VLAN"
+            ;;
+    esac
+    $ECHO "(${_ip_type_} Should be given as mandatory entry)"
+    $ECHO "If there are multiple IP addresses to be entered, then they should be separated by comma"
+    read _ipmp_arp_value_
+
+    _ipmp_arp_values_=`$ECHO ${_ipmp_arp_value_} | $SED -e 's/ //g'`
+
+    _arp_list_=`$ECHO ${_ipmp_arp_values_} | $TR ',' ' '`
+
+    _number_arp_=`$ECHO ${_arp_list_} | $WC -w`
+
+    if [ ${_number_arp_} -lt 1 ]; then
+        $ECHO "Please enter at-least one IP which are in same subnet, press <enter> to continue"
+        read _wait_
+        continue
+    fi
+
+    for i in ${_arp_list_}; do
+        validate_ip ${i}
+        if [ $? -ne 0 ]; then
+            _invalid_ip_="Y"
+        fi
+    done
+
+    if [ "${_invalid_ip_}" == "Y" ]; then
+        continue
+    fi
+
+    if [ "${_ipmp_grp_name_}" == "PM Services Group" ]; then
+        _pm_arp_target_="${_ipmp_arp_values_}"
+    elif [ "${_ipmp_grp_name_}" == "Storage Group" ]; then
+        _storage_vlan_arp_target_="${_ipmp_arp_values_}"
+    elif [ "${_ipmp_grp_name_}" == "Backup Group" ]; then
+        _backup_vlan_arp_target_="${_ipmp_arp_values_}"
+    elif [ "${_ipmp_grp_name_}" == "ENM Group" -o "${_ipmp_grp_name_}" == "OSSRC Group" ]; then
+         _enm_vlan_arp_target_="${_ipmp_arp_values_}"
+    fi
+
+    break
+done
+}
+
+### Function: configure_storage_vlan ###
+#
+# To configure the storage VLAN interface
+#
+# Arguments:none
+#
+# Return Values:
+#         none
+configure_storage_vlan()
+{
+_int_type_=$1
+
+# Network service name
+_network_svc_="network.service"
+
+# Take the inputs from USER_CONF if present
+if [ -s ${USER_CONF} ]; then
+    _temp_user_conf_=${USER_CONF}
+fi
+_stor_intf_=`read_value ${_int_type_}_INTF ${_temp_user_conf_}|cut -d" " -f1` || abort_script "${_stor_intf_}" "${EXEC_SHELL_CMD}"
+_stor_ip_=`read_value ${_int_type_}_IP ${_temp_user_conf_}` || abort_script "${_stor_ip_}" "${EXEC_SHELL_CMD}"
+_stor_subnet_=`read_value ${_int_type_}_SUBNET ${_temp_user_conf_}` || abort_script "${_stor_subnet_}" "${EXEC_SHELL_CMD}"
+_stor_gateway_=`read_value ${_int_type_}_GATEWAY ${_temp_user_conf_}` || abort_script "${_stor_gateway_}" "${EXEC_SHELL_CMD}"
+
+# Check if the IP already assigned to any interface
+_existing_intf_=`$IP addr show | $GREP "${_stor_ip_}/${_stor_subnet_}" | $AWK '{print $NF}'`
+if [ "${_existing_intf_}" ]; then
+    # Return from here as the user selected interface and ip is configured
+    if [ "${_existing_intf_}" == "${_stor_intf_}" ]; then
+        logit "Storage VLAN interface ${_stor_intf_} is already created."
+        return 0
+    fi
+
+    # Recreate the interface to remove the IP if it is not user selected interface
+    logit "Un-assigning the IP address ${_stor_ip_}/${_stor_subnet_} from ${_stor_intf_}"
+    $NMCLI con del ${_existing_intf_} >> /dev/null 2>&1
+    if [ $? -ne 0 ]; then
+        _err_msg_="Could not delete the existing interface ${_existing_intf_}"
+        abort_script "${_err_msg_}" "${EXEC_SHELL_CMD}"
+    fi
+    logit -q "Successfully removed the existing interface ${_existing_intf_}"
+
+    logit -q "Recreating the removed interface ${_existing_intf_}"
+    $NMCLI con add type ethernet \
+           ifname ${_existing_intf_} \
+           con-name ${_existing_intf_} \
+           connection.autoconnect no >> /dev/null 2>&1
+    if [ $? -ne 0 ]; then
+        _err_msg_="Could not re-create the interface ${_existing_intf_}"
+        abort_script "${_err_msg_}" "${EXEC_SHELL_CMD}"
+    fi
+    logit "Successfully unassigned the IP address ${_stor_ip_}/${_stor_subnet_} from ${_stor_intf_}"
+fi
+
+# Create the storage interface
+$NMCLI con mod ${_stor_intf_} \
+       ipv4.method manual \
+       ipv4.addr ${_stor_ip_}/${_stor_subnet_} \
+       ipv4.gateway ${_stor_gateway_} \
+       ipv4.never-default true \
+       connection.autoconnect yes >> /dev/null 2>&1
+if [ $? -ne 0 ]; then
+    _err_msg_="Could not configure the storage VLAN interface ${_stor_intf_}"
+    abort_script "${_err_msg_}" "${EXEC_SHELL_CMD}"
+fi
+
+logit "Created the storage VLAN interface ${_stor_intf_} successfully"
+
+# Check if the interface is up
+$NMCLI con show --active | $GREP -w ${_stor_intf_} >>/dev/null 2>&1
+if [ $? -ne 0 ]; then
+    logit "Restarting the network service"
+    $SYSTEMCTL restart ${_network_svc_}
+    _ns_state_=`$SYSTEMCTL show ${_network_svc_} -p ActiveState | $CUT -f2 -d=`
+    if [ "${_ns_state_}" != "active" ]; then
+        _err_msg_="Failed to start ${_network_svc_}"
+        abort_script "${_err_msg_}" "${EXEC_SHELL_CMD}"
+    fi
+    logit "${_network_svc_} successfully restarted"
+    $NMCLI con show --active | $GREP -w ${_stor_intf_} >>/dev/null 2>&1
+    if [ $? -ne 0 ]; then
+        _err_msg_="Could not bring storage interface ${_stor_intf_} up."
+        abort_script "${_err_msg_}" "${EXEC_SHELL_CMD}"
+    fi
+fi
+
+logit "Successfully configured the storage VLAN interface ${_stor_intf_}"
+}
+
+### Function: copy_from_nas_backup ###
+#
+#   copy files from NAS to server
+#
+# Arguments:
+#       none
+# Return Values:
+#       none
+copy_from_nas_backup()
+{
+insert_header_footer head "Entering stage - ${NEXT_STAGE}" ${LOGFILE}
+
+# Create /eniq/installation directory
+$MKDIR -p ${ENIQ_INST_DIR}
+if [ $? -ne 0 ]; then
+    _err_msg_="Could not create directory ${ENIQ_INST_DIR}"
+    abort_script "${_err_msg_}" "${EXEC_SHELL_CMD}"
+fi
+
+# Create /eniq/local_logs directory
+$MKDIR -p ${ENIQ_LOCAL_LOGS_DIR}
+if [ $? -ne 0 ]; then
+    _err_msg_="Could not create directory ${ENIQ_LOCAL_LOGS_DIR}"
+    abort_script "${_err_msg_}" "${EXEC_SHELL_CMD}"
+fi
+
+# Mounting NAS FS
+mount_nas_fs
+
+# Copy config, local_logs and /var/tmp/upgrade directory from NAS backup
+logit "Copying config directory from NAS backup"
+restore_data_from_NAS ${ENIQ_PORTBACKUP}/${HNAME}/ZFS/${ENIQ_INST_DIR} ${ENIQ_INST_DIR}
+
+#Checking the available size of ROOT file system and keeping 5GB buffer size while copying local_logs
+_size_port_=`$DU -sk ${ENIQ_PORTBACKUP}/${HNAME}/ZFS/${ENIQ_LOCAL_LOGS_DIR} |$AWK '{print $1}'`
+_size_port_local_log_=`$EXPR 2 \* ${_size_port_}`
+_size_root_avail_=`$DF -k / |$AWK 'NR==2{print $4}'`
+
+#Removing flag file of successfully copy of eniq/local_logs
+$RM -rf ${VAR_TMP}/local_logs_sucess
+
+#keeping 5GB buffer size
+_size_root_=`$EXPR ${_size_root_avail_} - 5242880`
+
+#Copying the local_logs directory from NAS backup
+if [ ${_size_port_local_log_} -lt ${_size_root_} ]; then 
+    logit "\nCopying All local_logs directory from NAS backup"
+    restore_data_from_NAS ${ENIQ_PORTBACKUP}/${HNAME}/ZFS/${ENIQ_LOCAL_LOGS_DIR} ${ENIQ_LOCAL_LOGS_DIR}
+    #Creating a flag file in order to indicate all local_logs are restored
+    $TOUCH ${VAR_TMP}/local_logs_sucess
+else
+    logit "\nCopying Selective local_logs directory from NAS backup"
+    for _log_dir_ in `$ECHO ${LOCAL_LOGS_LIST}`; do
+        if [ -d ${ENIQ_PORTBACKUP}/${HNAME}/ZFS/${ENIQ_LOCAL_LOGS_DIR}/${_log_dir_} ] || [ -f ${ENIQ_PORTBACKUP}/${HNAME}/ZFS/${ENIQ_LOCAL_LOGS_DIR}/${_log_dir_} ]; then
+            _size_dir_=`$DU -sk ${ENIQ_PORTBACKUP}/${HNAME}/ZFS/${ENIQ_LOCAL_LOGS_DIR}/${_log_dir_} |$AWK '{print $1}'`
+            _size_root_avail_=`$DF -k / |$AWK 'NR==2{print $4}'`
+            _size_root_=`$EXPR ${_size_root_avail_} - 5242880`
+            if [ ${_size_dir_} -lt ${_size_root_} ]; then
+                logit "\nCopying ${ENIQ_LOCAL_LOGS_DIR}/${_log_dir_} directory from NAS backup"
+                $CP -pr ${ENIQ_PORTBACKUP}/${HNAME}/ZFS/${ENIQ_LOCAL_LOGS_DIR}/${_log_dir_} ${ENIQ_LOCAL_LOGS_DIR}
+            else
+                logit "\nSufficient space is not available on root partition. Unable to copy ${ENIQ_LOCAL_LOGS_DIR}/${_log_dir_} directory from NAS backup. Files will be attempted to copy later."
+            fi
+        fi
+    done
+fi
+
+logit "\nCopying /var/tmp/upgrade directory from NAS backup"
+restore_data_from_NAS ${ENIQ_PORTBACKUP}/${HNAME}/ROOT/${VAR_TMP} ${VAR_TMP}
+
+# Copying /etc/hosts and /etc/netmasks files from NAS backup
+for _file_ in `$ECHO ${CONFIG_FILE_LIST}`; do
+    logit "\nCopying ${_file_} file from NAS backup"
+    $CAT ${ROOT_ETC}/${_file_} > /etc/${_file_}
+    if [ $? -ne 0 ]; then
+       _err_msg_="Failed to copy ${_file_} to /etc directory"
+       abort_script "${_err_msg_}" "${EXEC_SHELL_CMD}"
+    fi
+done
+
+# Update eniq_sw_locate file
+logit -q "Updating ${ENIQ_INST_DIR}/eniq_sw_locate file using ${ENIQ_CONF_DIR}/rhelonly_sw_locate"
+$CP -pf ${ENIQ_CONF_DIR}/rhelonly_sw_locate ${ENIQ_CONF_DIR}/eniq_sw_locate
+if [ $? -ne 0 ]; then
+    _err_msg_="Could not update ${ENIQ_INST_DIR}/eniq_sw_locate file"
+    abort_script "${_err_msg_}" "${EXEC_SHELL_CMD}"
+fi
+
+# Unpack latest ENIQ media on Server
+unpack_inst_eniq_sw
+
+# Restoring eniq_core_inst_stage file from NAS backup
+$CP -pf ${ENIQ_PORTBACKUP}/${HNAME}/ZFS/${ENIQ_CORE_INST_DIR}/etc/eniq_core_inst_stage ${ENIQ_CORE_INST_DIR}/etc
+if [ $? -ne 0 ]; then
+     _err_msg_="Failed to restore eniq_core_inst_stage file to ${ENIQ_CORE_INST_DIR}/etc directory"
+     abort_script "${_err_msg_}" "${EXEC_SHELL_CMD}"
+fi
+
+# Check mandatory scripts and config files are availble
+check_required_scripts_files
+
+# Get interface details
+if [ ! -s "${MIG_DIR}/enm_interface_details" ]; then
+
+      # Source the common functions
+      if [ -s ${ENIQ_CORE_INST_DIR}/lib/common_functions.lib ]; then
+           . ${ENIQ_CORE_INST_DIR}/lib/common_functions.lib
+      else
+            _err_msg_="File ${ENIQ_CORE_INST_DIR}/lib/common_functions.lib not found"
+            abort_script "${_err_msg_}" "${EXEC_SHELL_CMD}"
+      fi
+
+      _pm_bond_intf_=`read_value PM_INTF ${USER_CONF}| $AWK '{print $2}'`
+      _str_int_=`read_value STOR_VLAN_INTF ${USER_CONF}`
+      _backup_vlan_interface_name_=`read_value BACKUP_VLAN_INTF ${USER_CONF}`
+      STOR_CONFIRM=`read_value STORAGE_VLAN_CONFIRMATION ${USER_CONF}`
+      backup_vlan_confirmation=`read_value BACKUP_VLAN_CONFIRMATION ${USER_CONF}`
+      get_interface_details
+fi
+
+# If everything goes well copy the temp conf file to original location
+if [ -s "${MIG_DIR}/enm_interface_details" ]; then
+      $CAT ${MIG_DIR}/enm_interface_details >> ${USER_CONF}
+      if [ $? -ne 0 ]; then
+            _err_msg_="Unable to save ${USER_CONF}"
+            abort_script "${_err_msg_}" "${EXEC_SHELL_CMD}"
+      fi
+      SFS_Migrated=`read_value SFS_to_VA ${USER_CONF}`
+      if [ "${SFS_Migrated}" == "YES" ]; then
+           configure_storage_vlan "OLD_STOR_VLAN"
+      fi
+fi
+
+logit -q "Saved ${_temp_user_conf_} as ${USER_CONF}"
+
+logit "Successfully taken user inputs."
+
+insert_header_footer foot "Successfully completed stage - ${NEXT_STAGE} " ${LOGFILE}
+
+set_next_stage `$EXPR ${ARRAY_ELEM} + 1`
+
+}
+
+
+
+### Function: get_absolute_path ###
+#
+# Determine absolute path to software
+#
+get_absolute_path()
+{
+_dir_=`$DIRNAME $0`
+SCRIPTHOME=`cd $_dir_ 2>/dev/null && pwd || $ECHO $_dir_`
+
+}
+
+
+### Function: get_array_element ###
+#
+# Get the current array element number
+#
+# Arguments:
+#   nones
+# Return Values:
+#   none
+get_array_element()
+{
+_array_length_=${#LIN_MIG_STAGES[*]}
+_array_length_=`${EXPR} ${_array_length_} - 1`
+
+for (( _elem_=0; _elem_<=${_array_length_}; _elem_++ )); do
+    $ECHO ${LIN_MIG_STAGES[${_elem_}]} | $GREP -w ${NEXT_STAGE} >> /dev/null 2>&1
+    if [ $? -eq 0 ]; then
+        ARRAY_ELEM=${_elem_}
+        break
+    fi
+done
+}
+
+
+### Function: get_backup_details ###
+#
+#   Get details of migration backup from user
+#
+# Arguments:
+#       none
+# Return Values:
+#       none
+get_backup_details()
+{
+
+while :; do
+    clear
+    _disp_file_=${TEM_DIR}/disp_file
+    $RM -rf ${_disp_file_} >> /dev/null 2>&1
+    print_heading "Migration Backup Information" > ${_disp_file_}
+
+    # Get IP address of migration backup server
+    while :; do
+        $ECHO "\nEnter Migration backup server IP address "
+        read _mig_nas_ip_
+        validate_ip ${_mig_nas_ip_}
+        if [ $? -ne 0 ]; then
+            continue
+        fi
+
+        # Check if IP present in temporary ip list
+        if [ `$GREP -w ${_mig_nas_ip_} ${_ip_input_list_} 2> /dev/null` ];then
+            $ECHO "value already entered in other field\n"
+            continue
+        fi
+
+        # Check if IP is reachable
+        $PING -c 1 ${_mig_nas_ip_} >>/dev/null 2>&1
+        if [ $? -ne 0 ]; then
+            $ECHO "unreachable IP entered\n"
+            continue
+        fi
+        break
+    done
+
+    # Get directory name of migration sw on backup server
+    while :; do
+        $ECHO "\nEnter the directory path of Migration backup [e.g. /vx/<NAS_POOL>-portbackup]"
+        read _mig_nas_dir_
+        if [ -z $_mig_nas_dir_ ]; then
+            continue
+        fi
+        break
+    done
+
+    $PRINTF "%-40s" "Migration backup server IP address" >> ${_disp_file_}
+    $ECHO ": ${_mig_nas_ip_}" >> ${_disp_file_}
+    $PRINTF "%-40s" "Directory path of Migration backup" >> ${_disp_file_}
+    $ECHO ": ${_mig_nas_dir_}" >> ${_disp_file_}
+
+    # Display values to user
+    $CAT ${_disp_file_}
+    user_confirm
+
+    if [ "${_response_}" != "YES" ];then
+        continue
+    fi
+
+    $CAT ${_disp_file_} >> ${LOGFILE}
+
+    # Save the user input values
+    set_conf_value "MIG_NAS_IP" "${_mig_nas_ip_}" ${_temp_user_conf_}
+    set_conf_value "MIG_NAS_DIR" "${_mig_nas_dir_}" ${_temp_user_conf_}
+    break
+done
+
+logit "Saved migration backup information"
+}
+
+### Function: get_interface_details ###
+#
+# Get details of PM, Storage and Backup Group
+#
+# Arguments:
+#       none
+# Return Values:
+#       none
+get_interface_details()
+{
+while :; do
+        # Removing any previous list
+        $RM -rf ${_ip_input_list_} >> /dev/null 2>&1
+
+        _disp_file_=${TEM_DIR}/disp_file
+        $RM -rf ${_disp_file_} >> /dev/null 2>&1
+        $ECHO "==================USER VALUE CONFIRMATION ==================" > ${_disp_file_}
+
+if [ -s "${MIGRATION_CONF}" ]; then
+           > ${_temp_user_conf_}
+           _ENM_=`$CAT ${MIGRATION_CONF} | $GREP _diff_subnet_ENM_ | $AWK -F\= '{print \$2}'`
+           _SFS_=`$CAT ${MIGRATION_CONF} | $GREP _SFS_to_VA_ | $AWK -F\= '{print \$2}'`
+	   $ECHO "ENM_CONFIGURED=${_ENM_}" >> ${_temp_user_conf_}
+	   $ECHO "SFS_to_VA=${_SFS_}" >> ${_temp_user_conf_}
+           if [ "${_ENM_}" == "YES" ]; then
+              if [ "${_SFS_}" == "YES" ]; then
+                  interface_list "no" "OSSRC Group"
+                  common_get_vlan_arp "OSSRC Group"
+                  # User enters storage gateway IP
+                  while :; do
+                          $ECHO "\nEnter the gateway IP address of OSSRC Storage VLAN"
+                              read _stor_vlan_gateway_ 
+                              validate_ip ${_stor_vlan_gateway_}
+                              if [ $? -ne 0 ]; then
+                                  $ECHO "Could not validate ${_stor_vlan_gateway_}" >> ${LOGFILE}
+                                  $ECHO "Please enter a valid ip address"
+                                  continue
+                              fi
+                              break
+                 done
+
+                  _storage_ip_=`iniget IPMP_INTF_2 -f ${ENIQ_CONF_DIR}/ipmp.ini -v IPMP_Group_IP`
+                  _stor_vlan_netmask_=`iniget IPMP_INTF_2 -f ${ENIQ_CONF_DIR}/ipmp.ini -v IPMP_Group_Netmask`
+                  _old_stor_subnet_=`get_network_from_netmask ${_stor_vlan_netmask_}`
+         
+                  $ECHO "OLD_STOR_VLAN_INTF=${_enm_str_int_}" >> ${_temp_user_conf_}
+                  $ECHO "OLD_STOR_VLAN_IP=${_storage_ip_}" >> ${_temp_user_conf_}
+                  $ECHO "OLD_STOR_VLAN_NETMASK=${_stor_vlan_netmask_}" >> ${_temp_user_conf_}
+                  $ECHO "OLD_STOR_VLAN_SUBNET=${_old_stor_subnet_}" >> ${_temp_user_conf_}
+                  $ECHO "OLD_STOR_VLAN_GATEWAY=${_stor_vlan_gateway_}" >> ${_temp_user_conf_}
+                  $ECHO "OLD_STOR_VLAN_ARP=${_enm_vlan_arp_target_}" >> ${_temp_user_conf_}
+              
+             else
+                  interface_list "no" "ENM Group"
+                  common_get_vlan_arp "ENM Group"
+                  while :; do
+                          $ECHO "\nEnter the gateway IP address of ENM Storage VLAN"
+                              read _enm_vlan_gateway_
+                              validate_ip ${_enm_vlan_gateway_}
+                              if [ $? -ne 0 ]; then
+                                  $ECHO "Could not validate ${_enm_vlan_gateway_}" >> ${LOGFILE}
+                                  $ECHO "Please enter a valid ip address"
+                                  continue
+                              fi
+                              break
+                 done
+
+                  _enm_ip_=`iniget IPMP_INTF_4 -f ${ENIQ_CONF_DIR}/ipmp.ini -v IPMP_Group_IP`
+                  _enm_vlan_netmask_=`iniget IPMP_INTF_4 -f ${ENIQ_CONF_DIR}/ipmp.ini -v IPMP_Group_Netmask`
+
+                  $ECHO "ENM_STOR_VLAN_INTF=${_enm_str_int_}" >> ${_temp_user_conf_}
+                  $ECHO "ENM_STOR_VLAN_IP=${_enm_ip_}" >> ${_temp_user_conf_}
+                  $ECHO "ENM_STOR_VLAN_NETMASK=${_enm_vlan_netmask_}" >> ${_temp_user_conf_}
+                  $ECHO "ENM_STOR_VLAN_GATEWAY=${_enm_vlan_gateway_}" >> ${_temp_user_conf_}
+                  $ECHO "ENM_STOR_VLAN_ARP=${_enm_vlan_arp_target_}" >> ${_temp_user_conf_}
+             fi
+
+         fi
+
+         $CAT ${_temp_user_conf_} >> ${MIG_DIR}/enm_interface_details
+         return 0
+fi
+
+        interface_list "yes" "PM Services Group"
+        get_pm_services_info
+
+        common_get_vlan_arp "PM Services Group"
+
+        print_heading "PM Services Interface Information" >> ${_disp_file_}
+        $ECHO "Interfaces for PM Services Group:${_pm_int_} ${_pm_bond_intf_}" >> ${_disp_file_}
+        $ECHO "PM Services IP Address:${_pm_ip_}" >> ${_disp_file_}
+        $ECHO "PM Services Netmask IP Address:${_pm_net_ip_}" >> ${_disp_file_}
+        $ECHO "PM Services Gateway IP address:${_pm_gateway_}" >> ${_disp_file_}
+        $ECHO "PM Services ARP Target(s):${_pm_arp_target_}" >> ${_disp_file_}
+
+        
+        while :; do
+                user_confirm "\nIs Storage VLAN configured on ${HNAME}? (Yes/No)"
+                STOR_CONFIRM="${_response_}"
+                set_conf_value "STOR_VLAN_CONFIRMATION" "${STOR_CONFIRM}" ${_temp_user_conf_}
+                if [ "${_response_}" == "YES" ]; then
+                      confirmation="YES"
+                      interface_list "no" "Storage Group"
+
+                      while :; do
+                                  $ECHO "\nEnter the Storage VLAN Interface IP "
+                                  read _str_ip_
+                                  validate_ip ${_str_ip_}
+                                  if [ $? -ne 0 ]; then
+                                      $ECHO "Could not validate ${_str_ip_}" >> ${LOGFILE}
+                                      $ECHO "Please enter a valid ip address"
+                                      continue
+                                  fi
+                                  break
+                              done
+
+                      while :; do
+                                  $ECHO "\nEnter the Storage VLAN Interface NETMASK"
+                                  read _str_net_ip_
+                                  validate_ip ${_str_net_ip_}
+                                  if [ $? -ne 0 ]; then
+                                      $ECHO "Could not validate ${_str_net_ip_}" >> ${LOGFILE}
+                                      $ECHO "Please enter a valid ip address"
+                                      continue
+                                  fi
+                                  break
+                              done
+
+                      # User enters storage gateway IP
+                      while :; do
+                              $ECHO "\nEnter the gateway IP address of Storage VLAN"
+                              read _stor_gateway_
+                              validate_ip ${_stor_gateway_}
+                              if [ $? -ne 0 ]; then
+                                  $ECHO "Could not validate ${_stor_gateway_}" >> ${LOGFILE}
+                                  $ECHO "Please enter a valid ip address"
+                                  continue
+                              fi
+                              break
+                      done
+
+                      common_get_vlan_arp "Storage Group"
+
+                      print_heading "Storage Interface Information" >> ${_disp_file_}
+                      $ECHO "Storage VLAN Interface Name:${_str_int_}" >> ${_disp_file_}
+                      $ECHO "Storage VLAN IP Address:${_str_ip_}" >> ${_disp_file_}
+                      $ECHO "Storage VLAN Netmask IP Address:${_str_net_ip_}" >> ${_disp_file_}
+                      $ECHO "Storage VLAN Gateway IP address:${_stor_gateway_}" >> ${_disp_file_}
+                      $ECHO "Storage VLAN ARP Target(s):${_storage_vlan_arp_target_}" >> ${_disp_file_}
+                else
+                      confirmation="NO"
+                      break
+                fi
+
+                break
+        done
+
+        while :; do
+                user_confirm "\nIs Backup VLAN configured on ${HNAME}? (Yes/No)"
+                BACKUP_CONFIRM="${_response_}"
+                set_conf_value "BACKUP_VLAN_CONFIRMATION" "${BACKUP_CONFIRM}" ${_temp_user_conf_}
+                if [ "${_response_}" == "YES" ]; then
+                    backup_vlan_confirmation="YES"
+                    interface_list "no" "Backup Group"
+                    common_get_vlan_arp "Backup Group"
+                    print_heading "Backup Interface Information" >> ${_disp_file_}
+                    $ECHO "Backup VLAN Interface Name:${_backup_vlan_interface_name_}" >> ${_disp_file_}
+                    $ECHO "Backup VLAN ARP Target(s):${_backup_vlan_arp_target_}" >> ${_disp_file_}
+                    break
+                else
+                    backup_vlan_confirmation="NO"
+                   break
+                fi
+        done
+
+        # Display values to user
+        $CAT ${_disp_file_}
+        user_confirm
+        if [ "${_response_}" != "YES" ];then
+              unset _pm_bond_intf_ _str_int_ STOR_CONFIRM _backup_vlan_interface_name_ backup_vlan_confirmation 
+              continue
+        fi
+
+        $CAT ${_disp_file_} >> ${LOGFILE}
+        if [ "${confirmation}" == "YES" ]; then
+             # Convert the netmask to subnet
+             _stor_subnet_=`get_network_from_netmask ${_str_net_ip_}`
+        fi
+
+        # Save the user input values
+        $ECHO "PM_INTF=${_pm_int_} ${_pm_bond_intf_}" > ${_temp_user_conf_}
+        $ECHO "PM_IP=${_pm_ip_}" >> ${_temp_user_conf_}
+        $ECHO "PM_NETMASK=${_pm_net_ip_}" >> ${_temp_user_conf_}
+        $ECHO "PM_SUBNET=${_pm_subnet_}" >> ${_temp_user_conf_}
+        $ECHO "PM_GATEWAY=${_pm_gateway_}" >> ${_temp_user_conf_}
+        $ECHO "PM_ARP_TARGET=${_pm_arp_target_}" >> ${_temp_user_conf_}
+        $ECHO "STORAGE_VLAN_CONFIRMATION=${confirmation}" >> ${_temp_user_conf_}
+        $ECHO "STOR_VLAN_INTF=${_str_int_}" >> ${_temp_user_conf_}
+        $ECHO "STOR_VLAN_IP=${_str_ip_}" >> ${_temp_user_conf_}
+        $ECHO "STOR_VLAN_NETMASK=${_str_net_ip_}" >> ${_temp_user_conf_}
+        $ECHO "STOR_VLAN_SUBNET=${_stor_subnet_}" >> ${_temp_user_conf_}
+        $ECHO "STOR_VLAN_GATEWAY=${_stor_gateway_}" >> ${_temp_user_conf_}
+        $ECHO "STOR_VLAN_ARP_TARGET=${_storage_vlan_arp_target_}" >> ${_temp_user_conf_}
+        $ECHO "BACKUP_VLAN_CONFIRMATION=${backup_vlan_confirmation}" >> ${_temp_user_conf_}
+        $ECHO "BACKUP_VLAN_INTF=${_backup_vlan_interface_name_}"  >> ${_temp_user_conf_}
+        $ECHO "BACKUP_VLAN_ARP_TARGET=${_backup_vlan_arp_target_}" >> ${_temp_user_conf_}
+        break
+    done
+
+# Configure the storage vlan if needed.
+_str_conf_=`$CAT ${_temp_user_conf_} | $GREP "^STORAGE_VLAN_CONFIRMATION=" | $AWK -F\= '{print $2}'`
+if [ ${_str_conf_} == "YES" ]; then
+    configure_storage_vlan "STOR_VLAN"
+    $CP -f ${_temp_user_conf_} ${MIG_DIR}/vlan_interface_details
+fi
+
+}
+
+### Function: get_new_lun_id ###
+#
+# Get the merged/new LUN ID from user
+#
+# Arguments:
+#     None
+# Return values:
+#     None
+get_new_lun_id()
+{
+# Take the LUN ID of the newly created LUN
+while :; do
+    clear
+    _disp_file_=${TEM_DIR}/disp_file
+    $RM -rf ${_disp_file_} >> /dev/null 2>&1
+    print_heading "New LUN ID Information" > ${_disp_file_}
+
+    # Get newly created LUN ID
+    while :; do
+        $ECHO "\nEnter LUN ID of the newly created LUN: "
+        read _new_lun_id_
+        if [ ! ${_new_lun_id_} ]; then
+            continue
+        fi
+
+        $ECHO ${_new_lun_id_} | $EGREP "^[0-9]+$" >> /dev/null 2>&1
+        if [ $? -ne 0 ]; then
+            $ECHO "expected numeric value\n"
+            continue
+        fi
+        break
+    done
+
+    $ECHO "ID of the newly created LUN : ${_new_lun_id_}" >> ${_disp_file_}
+
+    # Display values to user
+    $CAT ${_disp_file_}
+    user_confirm
+
+    if [ "${_response_}" != "YES" ];then
+        continue
+    fi
+
+    $CAT ${_disp_file_} >> ${LOGFILE}
+    break
+done
+
+# Save the user input values
+set_conf_value "MERGED_LUN_ID" "${_new_lun_id_}" ${_temp_user_conf_}
+
+logit -q "Saved LUN ID"
+}
+
+
+### Function: get_next_stage ###
+#
+# Get the stage to be run
+#
+get_next_stage()
+{
+ARRAY_ELEM=0
+
+if [ -s ${STAGEFILE} ]; then
+    NEXT_STAGE=`$CAT ${STAGEFILE}|$EGREP -v '^[ 	]*#' | $SED -e 's| ||g'`
+    if [ ! "$NEXT_STAGE" ]; then
+        _err_msg_="ERROR: Failed to read stage from ${STAGEFILE}, exiting."
+        abort_script "$_err_msg_" "${EXEC_SHELL_CMD}"
+    fi
+    if [ "$NEXT_STAGE" == "cleanup" ]; then
+        return 0
+    else
+        $ECHO ${LIN_MIG_STAGES[*]} | $GREP -w ${USER_STAGE} >> /dev/null 2>&1
+        if [ $? -eq 0 ]; then
+            _err_msg_="Specified stage ${USER_STAGE} is not a valid migration stage"
+            abort_script "$_err_msg_" "${EXEC_SHELL_CMD}"
+        fi
+    fi
+    # Get the element number so we can move along the array
+    get_array_element
+else
+    $MKDIR -p `$DIRNAME ${STAGEFILE}`
+    if [ $? -ne 0 ]; then
+        _err_msg_="Failed to create directory `$DIRNAME ${STAGEFILE}`, exiting."
+        abort_script "$_err_msg_" "${EXEC_SHELL_CMD}"
+    fi
+    NEXT_STAGE=${LIN_MIG_STAGES[${ARRAY_ELEM}]}
+fi
+}
+
+
+### Function: get_network_from_netmask ###
+#
+# Get the network number suffix from netmask IP
+#
+# Arguments:
+#   $1 : Client Netmask IP
+# Return Values:
+#      : Network number suffix
+get_network_from_netmask()
+{
+local nm1 nm2 nm3 nm4
+local nm1_bin nm2_bin nm3_bin nm4_bin
+
+# split out the parts of the netmask
+nm1=`$EXPR $1 : '\([0-9]*\)\..*'`
+nm2=`$EXPR $1 : '[0-9]*\.\([0-9]*\)\..*'`
+nm3=`$EXPR $1 : '[0-9]*\.[0-9]*\.\([0-9]*\)\..*'`
+nm4=`$EXPR $1 : '[0-9]*\.[0-9]*\.[0-9]*\.\([0-9]*\)'`
+
+# Convert to binary
+
+nm1_bin=`echo "obase=2;$nm1" | bc`
+nm2_bin=`echo "obase=2;$nm2" | bc`
+nm3_bin=`echo "obase=2;$nm3" | bc`
+nm4_bin=`echo "obase=2;$nm4" | bc`
+
+prefix="$nm1_bin$nm2_bin$nm3_bin$nm4_bin"
+
+# Count number of 1's, (awk -1)
+
+num=`echo $prefix | awk 'BEGIN{FS="1"} {print NF-1}'`
+
+$ECHO ${num}
+
+}
+
+### Function: get_pm_services_info ###
+#
+# Gets the PM Services interface, IP, netmask and gateway 
+# details
+# Arguments: none
+#   
+# Return Values: none  
+get_pm_services_info()
+{
+_pm_int_=`$NMCLI dev | $GREP -w "connected"|$SORT -u |$AWK '{print $1}'`
+if [ $? -ne 0 ]; then
+    _err_msg_="No interface configured for PM services"
+    abort_script "${_err_msg_}" "${EXEC_SHELL_CMD}"
+fi
+
+# Calling function to update domain name in interface file
+update_domain_name
+
+_pm_ip_=`read_value CLIENT_IP_ADDR ${ENIQ_CONF_DIR}/${HNAME}/${HNAME}_ks_cfg.txt`|| abort_script "${_pm_ip_}" "${EXEC_SHELL_CMD}"
+_pm_net_ip_=`read_value CLIENT_NETMASK ${ENIQ_CONF_DIR}/${HNAME}/${HNAME}_ks_cfg.txt`|| abort_script "${_pm_net_ip_}" "${EXEC_SHELL_CMD}"
+_pm_gateway_=`read_value CLIENT_GATEWAY ${ENIQ_CONF_DIR}/${HNAME}/${HNAME}_ks_cfg.txt|$SED -e 's/^"//' -e 's/"$//'`|| abort_script "${_pm_gateway_}" "${EXEC_SHELL_CMD}"
+
+# Convert the netmask to subnet
+_pm_subnet_=`get_network_from_netmask ${_pm_net_ip_}`
+}
+
+### Function: get_storage_option ###
+#
+# Get choice of hardware type
+#
+# Arguments:
+#       none
+# Return Values:
+#       none
+get_storage_option()
+{
+while :; do
+    _disp_file_=${TEM_DIR}/disp_file
+    $RM -rf ${_disp_file_} >> /dev/null 2>&1
+
+    print_heading "Available Hardware Options"
+    $ECHO "[1] Blade (raw)\n"
+    $ECHO "Please select the server type for migration"
+    read _user_value_
+    if [ -x $_user_value_ ]; then
+        continue
+    fi
+
+    if [ $_user_value_ -eq 1 ]; then
+        _server_type_="Blade"
+        _storage_type_=raw
+    else
+        $ECHO "Please choose valid hardware type."
+        continue
+    fi
+    print_heading "Hardware Type Confirmation" > ${_disp_file_}
+    $ECHO "Selected Hardware for Migration: ${_server_type_}" >> ${_disp_file_}
+
+    # Display values to user
+    $CAT ${_disp_file_}
+    user_confirm
+    if [ "${_response_}" != "YES" ];then
+        continue
+    fi
+
+    $CAT ${_disp_file_} >> ${LOGFILE}
+
+    # Save the user input values
+    $ECHO ${_storage_type_} > ${STORAGE_TYPE}
+    break
+done
+
+logit "Saved storage type"
+}
+
+
+### Function: get_storage_password ###
+#
+# This function will check if the migration conf file has the
+# storage admin password, if not present - get it from the user
+# and set it to the conf file.
+# Arguments:
+#       none
+# Return Values:
+#       none
+get_storage_password()
+{
+# This function will be worked upon in next user story
+return 0
+
+_no_of_san_=`$CAT ${MIGRATION_CONF} | $GREP "^STORAGE_NAME_" | $WC -l`
+
+for (( _count_=1; $_count_<=$_no_of_san_; _count_++ ));do
+    _stor_name_=`read_value STORAGE_NAME_${_count_} ${MIGRATION_CONF}` || abort_script "${_stor_name_}" "${EXEC_SHELL_CMD}"
+    $CAT ${MIGRATION_CONF} | $GREP "^STORAGE_PASS_${_count_}" >> /dev/null 2>&1
+    if [ $? -ne 0 ]; then
+        while [ 1 ]
+        do
+            $ECHO "Please enter the admin user password of $_stor_name_"
+            read _stor_pass_
+            _stor_pass_=`$ECHO ${_stor_pass_} | $OPENSSL enc -base64 `			
+            if [ ! "${_stor_pass_}" ];then
+                continue
+            else
+                set_conf_value "STORAGE_PASS_${_count_}" ${_stor_pass_} ${MIGRATION_CONF}
+                break
+            fi
+        done
+    fi
+done
+}
+
+
+### Function: get_user_input ###
+#
+# Get all the required information from user
+#
+# Arguments:
+#       none
+# Return Values:
+#       none
+get_user_input()
+{
+clear
+_temp_user_conf_=${TEM_DIR}/user_conf
+$RM -rf ${_temp_user_conf_} >>/dev/null 2>&1
+
+# Create a temporary file with user input ip list
+_ip_input_list_=${TEM_DIR}/ip_input_list
+$TOUCH ${_temp_user_conf_} ${_ip_input_list_}
+
+logit "Getting Migration Information from user"
+
+# Set hardware type 
+# As of now only "raw" is supported. It may change later
+$ECHO "raw" > ${STORAGE_TYPE}
+if [ ! -s "${STORAGE_TYPE}" ]; then
+    get_storage_option
+fi
+
+# Get required information from blade server
+_storage_type_=`$CAT ${STORAGE_TYPE}`
+if [ "${_storage_type_}" == "raw" ]; then
+    clear
+
+    logit "Migration started on Blade server"
+    
+    # Get interface details
+    if [ ! -s "${MIG_DIR}/vlan_interface_details" ]; then
+         get_interface_details
+    else
+         $CP -f ${MIG_DIR}/vlan_interface_details ${_temp_user_conf_}
+    fi
+
+    # Get migration backup details
+    get_backup_details
+
+    # Get LUN ID for ENIQ FS creation
+    get_new_lun_id
+fi
+
+# If everything goes well copy the temp conf file to original location
+$CP -f ${_temp_user_conf_} ${USER_CONF}
+if [ $? -ne 0 ]; then
+    _err_msg_="Unable to save ${USER_CONF}"
+    abort_script "${_err_msg_}" "${EXEC_SHELL_CMD}"
+fi
+
+logit -q "Saved ${_temp_user_conf_} as ${USER_CONF}"
+
+logit "Successfully taken user inputs."
+}
+
+
+### Function: initiate_migration ###
+#
+#    Calling eniq_linux_migration.bsh to
+#    invoke the migration
+#
+initiate_migration()
+{
+insert_header_footer head "Entering Linux Migration stage ${NEXT_STAGE}" ${LOGFILE}
+
+# Reading Value from Migration Conf File
+_action_type_=`read_value MIGRATION_ACTION ${MIGRATION_CONF}` || abort_script "${_action_type_}" "${EXEC_SHELL_CMD}"
+
+logit "Starting to execute Migration using command : $BASH ${ENIQ_MIGRATION_SCRIPT} -a ${_action_type_} -C"
+$BASH ${ENIQ_MIGRATION_SCRIPT} -a ${_action_type_} -C
+if [ $? -ne 0 ]; then
+    _err_msg_="Could not execute ${ENIQ_MIGRATION_SCRIPT}"
+    abort_script "$_err_msg_" "${EXEC_SHELL_CMD}"
+fi
+
+insert_header_footer foot "Successfully completed OS Migration on Linux" ${LOGFILE}
+
+set_next_stage `$EXPR ${ARRAY_ELEM} + 1`
+}
+
+### Function: interface_list###
+#
+#   Read backup_vlan_interface_name from user
+#
+# Arguments:
+#       none
+# Return Values:
+#       none
+interface_list()
+{
+_ask_for_single_interface_="$1"
+_intf_group_="$2"
+_nm_service_="NetworkManager.service"
+_retry_=0
+
+while [ ${_retry_} -lt 2 ]; do
+    _nm_state_=`$SYSTEMCTL show ${_nm_service_} -p ActiveState | $CUT -f2 -d=`
+    if [ "${_nm_state_}" != "active" ]; then
+        logit "Starting ${_nm_service_}"
+        _nm_enabled_=`$SYSTEMCTL is-enabled ${_nm_service_}`
+        if [ "${_nm_enabled_}" != "enabled" ]; then
+            logit "Enabling ${_nm_service_}"
+            $SYSTEMCTL enable ${_nm_service_} >>/dev/null 2>&1
+            if [ $? -ne 0 ]; then
+                logit "WARNING: Couldn't enable ${_nm_service_}"
+            fi
+        fi
+
+        $SYSTEMCTL start ${_nm_service_} >>/dev/null 2>&1
+    else
+        break
+    fi
+    _retry_=$((_retry_+1))
+done
+
+# List the interfaces which are not configured
+print_heading "Available Interfaces"
+$NMCLI dev | $GREP -w "disconnected" >> /dev/null 2>&1
+if [ $? -ne 0 ]; then
+    _err_msg_="No interface available for configuration on system."
+    abort_script "${_err_msg_}" "${EXEC_SHELL_CMD}"
+fi
+
+$NMCLI device | $GREP "disconnected" |$SORT -u |$AWK '{print $1}' > /tmp/available_interfaces
+
+$RM -rf /tmp/available_interfaces_with_mac
+
+for _available_interface_ in `$CAT /tmp/available_interfaces`
+do
+    _mac_addr_=`$IFCONFIG ${_available_interface_} 2> /dev/null | $EGREP "ether" | $AWK '{print $2}'`
+    $ECHO "${_available_interface_} ${_mac_addr_}" >> /tmp/available_interfaces_with_mac
+done
+
+if [ -z "${_pm_bond_intf_}" ]; then
+        $CAT /tmp/available_interfaces_with_mac
+else
+       if [ "${_intf_group_}" == "Storage Group" ]; then
+            $CAT /tmp/available_interfaces_with_mac | $GREP -v ${_pm_bond_intf_}
+       elif [ "${_intf_group_}" == "Backup Group" ]; then
+               if [ "${STOR_CONFIRM}" == "YES" ]; then
+                     $ECHO ${_str_int_} > /tmp/int_name
+                     _int_name_1_=`$CAT /tmp/int_name | $AWK '{print $1}'`
+                     _int_name_2_=`$CAT /tmp/int_name | $AWK '{print $2}'`
+                    $CAT /tmp/available_interfaces_with_mac | $GREP -v ${_pm_bond_intf_}|$GREP -v ${_int_name_1_} | $GREP -v ${_int_name_2_}
+               else 
+                    $CAT /tmp/available_interfaces_with_mac | $GREP -v ${_pm_bond_intf_}
+               fi
+        else
+               if [ "${STOR_CONFIRM}" == "YES" ]; then 
+                     $ECHO ${_str_int_} > /tmp/int_name
+                     _int_name_1_=`$CAT /tmp/int_name | $AWK '{print $1}'`
+                     _int_name_2_=`$CAT /tmp/int_name | $AWK '{print $2}'`
+               fi
+
+               if [ "${backup_vlan_confirmation}" == "YES" ]; then
+                     $ECHO ${_backup_vlan_interface_name_} > /tmp/backup_int_name
+                     _backup_int_name_1_=`$CAT /tmp/backup_int_name | $AWK '{print $1}'`
+                     _backup_int_name_2_=`$CAT /tmp/backup_int_name | $AWK '{print $2}'`
+                     $CAT /tmp/available_interfaces_with_mac |$GREP -v ${_pm_bond_intf_}| $GREP -v ${_int_name_1_} | $GREP -v ${_int_name_2_}| $GREP -v ${_backup_int_name_1_} | $GREP -v ${_backup_int_name_2_}
+               elif [ "${STOR_CONFIRM}" == "YES" ]; then
+                     $ECHO ${_str_int_} > /tmp/int_name 
+                     _int_name_1_=`$CAT /tmp/int_name | $AWK '{print $1}'`
+                     _int_name_2_=`$CAT /tmp/int_name | $AWK '{print $2}'`
+                     $CAT /tmp/available_interfaces_with_mac |$GREP -v ${_pm_bond_intf_}| $GREP -v ${_int_name_1_} | $GREP -v ${_int_name_2_}
+               else
+                     $CAT /tmp/available_interfaces_with_mac | $GREP -v ${_pm_bond_intf_}
+               fi
+        fi
+fi
+
+while :; do
+
+if [ "${_ask_for_single_interface_}" == "yes" ]; then
+     $ECHO "\nSelect one appropriate group interface configured for ${_intf_group_} from the list above (Example :<Interface_1>)"
+     _num_required_intf=1
+else
+     $ECHO "\nSelect two appropriate group interfaces configured for ${_intf_group_} from the list above separated by a space (Example :<Interface_1> <Interface_2>)"
+     _num_required_intf=2
+fi
+
+read _opt_
+
+if [ ! "${_opt_}" ]; then
+    continue
+fi
+
+_num_choice_=`$ECHO ${_opt_} | $WC -w`
+
+_opt_arr_=(${_opt_})
+
+if [ ${_num_choice_} -eq ${_num_required_intf} ]; then
+     if [ "${_ask_for_single_interface_}" == "no" ]; then
+          if [ ${_opt_arr_[0]} == ${_opt_arr_[1]} ]; then
+               $ECHO "Invalid interfaces, press <enter> to continue"
+               read _wait_
+               continue
+          fi
+     fi
+
+
+    _input_err_=0
+    for _interface_ in ${_opt_}; do
+            _entered_intf_=`$CAT /tmp/available_interfaces | $GREP ${_interface_}`
+
+            if [ "${_entered_intf_}" != "${_interface_}" ]; then
+                  _input_err_=1
+            fi
+    done
+    if [ ${_input_err_} -eq 1 ]; then
+            $ECHO "Incorrect interfaces entered, press <enter> to continue"
+            read _wait_
+            continue
+    fi
+
+elif [ ${_num_choice_} -ne ${_num_required_intf} ]; then
+        $ECHO "Incorrect format entered, press <enter> to continue"
+        read _wait_
+        continue
+fi
+if [ "${backup_vlan_confirmation}" == "YES" ]; then
+    _backup_vlan_interface_name_="${_opt_}"
+elif [ "${STOR_CONFIRM}" == "YES" ]; then
+    _str_int_="${_opt_}"
+else
+   _pm_bond_intf_="${_opt_}"
+fi
+
+if [ "${_ENM_}" == "YES" ]; then
+     _enm_str_int_="${_opt_}"
+fi
+
+break
+done
+
+}
+
+### Function: insert_header_footer ###
+#
+#   Insert a stage header/footer message
+#
+# Arguments:
+#   $1 : head/foot
+#   $2 : Message
+#   $3 : Logfile
+# Return Values:
+#   none
+insert_header_footer()
+{
+if [ $# -ne 3 ]; then
+    _err_msg_="3 Parameters must be passed to header/footer function"
+    abort_script "$_err_msg_" "${EXEC_SHELL_CMD}"
+fi	
+
+_type_=$1
+_msg_=$2
+_logfile_=$3
+
+if [ "$_type_" != "banner" -a "$_type_" != "head" -a "$_type_" != "foot" ]; then
+    _err_msg_="Only Param of banner/head/foot is allowed...exiting!"
+    abort_script "$_err_msg_" "${EXEC_SHELL_CMD}"
+fi	
+
+$MKDIR -p `$DIRNAME ${_logfile_}`
+if [ $? -ne 0 ]; then
+    _err_msg_="Could not create directory `$DIRNAME ${_logfile_}`"
+    abort_script "$_err_msg_" "${EXEC_SHELL_CMD}"
+fi	
+
+$TOUCH -a ${_logfile_}
+if [ $? -ne 0 ]; then
+    _err_msg_="Could not write to file ${_logfile_}"
+    abort_script "$_err_msg_" "${EXEC_SHELL_CMD}"
+fi
+
+_time_=`$DATE '+%Y-%b-%d_%H.%M.%S'`
+if [ "$_type_" == "banner" ]; then
+    $ECHO "\n=====================================================" | $TEE -a ${_logfile_}
+    $ECHO "-----------------------------------------------------" | $TEE -a ${_logfile_}
+    $ECHO "$_msg_" | $TEE -a ${_logfile_}
+    $ECHO "-----------------------------------------------------" | $TEE -a ${_logfile_}
+    $ECHO "=====================================================\n" | $TEE -a ${_logfile_}
+fi
+
+if [ "$_type_" == "head" ]; then
+    $ECHO "\n=====================================================" | $TEE -a ${_logfile_}
+    $ECHO "-----------------------------------------------------" | $TEE -a ${_logfile_}
+    $ECHO "$_time_ : $_msg_" | $TEE -a ${_logfile_}
+    $ECHO "-----------------------------------------------------" | $TEE -a ${_logfile_}
+fi
+
+if [ "$_type_" == "foot" ]; then
+    $ECHO "\n-----------------------------------------------------" | $TEE -a ${_logfile_}
+    $ECHO "$_time_ : $_msg_" | $TEE -a ${_logfile_}
+    $ECHO "-----------------------------------------------------" | $TEE -a ${_logfile_}
+    $ECHO "=====================================================\n" | $TEE -a ${_logfile_}
+fi
+
+}
+
+
+### Function: logit ###
+#
+#   Displays message to user and logs as well
+#   including timestamp
+#
+# Arguments:
+#   $1 : Message to be logged
+# Return Values:
+#   None
+logit()
+{
+_usage_msg_='
+Usage:
+    logit "<msg>"    : To display and log the message
+    logit -q "<msg>" : To log the message
+'
+if [ $# -lt 1 ]; then
+    $ECHO "ERROR: No arguments passed to logit function."
+    $ECHO "${_usage_msg_}"
+    exit 1
+fi
+
+if [ $# -gt 2 ]; then
+    $ECHO "ERROR: logit function accepts two arguments at most."
+    $ECHO "${_usage_msg_}"
+    exit 1
+fi
+
+# Get the message
+if [ "$1" == "-q" ]; then
+    _quiet_="YES"
+    _msg_="$2"
+else
+    _msg_="$1"
+fi
+
+# Get the timestamp
+_timestamp_=`$DATE '+%Y-%m-%d_%H:%M:%S'`
+
+# Print the message
+if [ "${LOGFILE}" ]; then
+    $ECHO "${_timestamp_}:: ${_msg_}" >> ${LOGFILE}
+fi
+
+if [ ! "${_quiet_}" ]; then
+    $ECHO "${_msg_}\n"
+fi
+}
+
+
+### Function: mount_nas_fs ###
+#
+# Mounting NAS filesystem
+#
+# Arguments:
+#   none
+# Return Values:
+#   none
+mount_nas_fs()
+{
+# NAS Directory
+NAS_DIR=`$CAT ${USER_CONF} | $GREP -w MIG_NAS_DIR | $AWK -F"=" '{print $2}'`
+
+# NAS IP
+NAS_IP=`$CAT ${USER_CONF} | $GREP -w MIG_NAS_IP | $AWK -F"=" '{print $2}'`
+
+# Create the mountpoint if its not there
+if [ ! -d ${ENIQ_PORTBACKUP} ]; then
+    logit "\nCreating mountpoint - ${ENIQ_PORTBACKUP}"
+    $MKDIR -p ${ENIQ_PORTBACKUP}
+    if [ $? -ne 0 ]; then
+        _err_msg_="Could not create mountpoint ${ENIQ_PORTBACKUP}"
+        abort_script "${_err_msg_}" "${EXEC_SHELL_CMD}"
+    fi
+fi
+
+# Flag to determine if a mount is required
+_mount_=0
+
+logit "Checking if ${ENIQ_PORTBACKUP} is already mounted\n"
+_mount_exists_=`mount | $GREP "${ENIQ_PORTBACKUP}" | $AWK '{print $1}'`
+if [ ! "${_mount_exists_}" ]; then
+    _mount_=1
+fi
+
+if [ ${_mount_} -eq 1 ]; then
+    logit "Mounting ${NAS_IP}:${NAS_DIR} on ${ENIQ_PORTBACKUP}"
+    mount -t nfs ${NAS_IP}:${NAS_DIR} ${ENIQ_PORTBACKUP} >> /dev/null 2>&1
+    if [ $? -ne 0 ]; then
+        _err_msg_="Could not mount ${NAS_IP}:${NAS_DIR} on ${ENIQ_PORTBACKUP}"
+        abort_script "${_err_msg_}" "${EXEC_SHELL_CMD}"
+    fi
+fi
+}
+
+
+### Function: print_heading ###
+#
+#   Displays message to user formatted with 
+#   '-' in next line
+#
+# Arguments:
+#   $1 : Message to be formatted
+# Return Values:
+#   None
+print_heading()
+{
+_msg_="$*"
+_len_=50
+if [ "${_msg_}" ]; then
+    _len_=`$ECHO ${_msg_} | $WC -c`
+fi
+
+# Print message followed by line of '-' below
+$ECHO "\n${_msg_}" 
+$PRINTF "%-${_len_}s" | $TR ' ' '-'
+$ECHO
+}
+
+
+### Function: read_value ###
+#
+#   Common function to get value from file
+#   having the param=value format
+#
+# Arguments:
+#       $1 : Parameter name
+#       $2 : File name
+# Return Values:
+#       $_value_
+read_value()
+{
+if [ $# -ne 2 ];then
+    _err_msg_="Incorrect number of arguments passed to read_value"
+    $ECHO "${_err_msg_}"
+    exit 1
+fi
+
+_param_=$1
+_file_=$2
+
+if [ ! -s ${_file_} ];then
+    _err_msg_="Could not find ${_file_} to read value from."
+    $ECHO "${_err_msg_}"
+    exit 1
+fi
+
+_value_=""
+# Read the value
+_value_=`$CAT ${_file_} | $GREP "^${_param_}=" | $CUT -f 2 -d =`
+if [ ! "${_value_}" ];then
+    _err_msg_="Could not get the ${_param_} value from ${_file_} file."
+    $ECHO "${_err_msg_}"
+    exit 1
+fi
+$ECHO $_value_
+}
+
+
+### Function: restore_data_from_NAS ###
+#
+#   Dumping data back to ENIQ from NAS
+#
+# Arguments:
+#       $1 - Source Directory
+#       $2 - Target Directory
+# Return Values:
+#       none
+restore_data_from_NAS()
+{
+for _dir_ in `$ECHO $1`; do
+    cd $1
+    # Copying only required files that need to be used in Linux. Excluding Solaris OS specific information and scripts
+    $FIND . -xdev -depth -print | $EGREP -vw ''${HNAME}'|'${HNAME}'_installation_param_details|bootargs|om_sw_locate|eniq_sw_locate' | $CPIO -pdum $2 >> /dev/null 2>&1
+    if [ $? -ne 0 ]; then
+        _err_msg_="Failed to copy data from NAS backup"
+        abort_script "${_err_msg_}" "${EXEC_SHELL_CMD}"
+    fi
+    cd /
+done
+}
+
+
+### Function: script_interrupt ###
+#
+#   Called if there is interrupt
+#
+# Arguments:
+#       none
+# Return Values:
+#       none
+script_interrupt()
+{
+$ECHO "\n"
+logit "User aborted the script $0. Exiting..."
+$RM -rf ${TEM_DIR}
+exit 1
+}
+
+
+### Function: set_conf_value ###
+#
+#   Common function to set value in file
+#   having the param=value format
+#
+# Arguments:
+#       $1 : Parameter name
+#       $2 : Value
+#       $3 : File name
+# Return Values:
+#       none
+set_conf_value()
+{
+if [ $# -ne 3 ];then
+    _err_msg_="Incorrect number of parameters passed to set_conf_value"
+    abort_script "${_err_msg_}"
+fi
+
+_param_=$1
+_value_=$2
+_file_=$3
+
+# Update param=value
+# Check if the param exists in file
+$CAT ${_file_} | $GREP "^${_param_}=" >> /dev/null 2>&1
+if [ $? -ne 0 ];then
+    $ECHO "${_param_}=${_value_}" >> ${_file_}
+else
+    $CAT ${_file_} | $SED 's/"${_param_}=*"/"${_param_}=${_value_}"/' > /tmp/updated_file.$$.$$
+    if [ $? -ne 0 ];then
+        _err_msg_="Failed to update ${_param_} value in ${_file_}"
+        abort_script "${_err_msg_}"
+    fi
+    $MV -f /tmp/updated_file.$$.$$ ${_file_}
+    if [ $? -ne 0 ];then
+        _err_msg_="Failed to save ${_param_} value in ${_file_}"
+        abort_script "${_err_msg_}"
+    fi
+fi
+}
+
+
+### Function: set_next_stage ###
+#
+# Set up the stage to be run
+#
+# Arguments:
+#   $1 : Stage to be set to. Either numeric value or 'cleanup'
+# Return Values:
+#   none
+set_next_stage()
+{
+_stage_time_=`$DATE '+%Y-%b-%d_%H.%M.%S'`
+$ECHO "# Setting new stage at $_stage_time_" > ${STAGEFILE} | $TEE -a ${LOGFILE}
+$ECHO "${LIN_MIG_STAGES[$1]} " >> ${STAGEFILE} | $TEE -a ${LOGFILE}
+}
+
+### Function: setup_migration_env###
+#
+#   Read NAS details from user
+#
+# Arguments:
+#       none
+# Return Values:
+#       none
+setup_migration_env()
+{
+# Initialize the variables
+ERICSSON_STOR_DIR=/ericsson/storage
+
+# Logfile directories
+ENIQ_LOCAL_LOGS_DIR=${ENIQ_BASE_DIR}/local_logs
+ENIQ_MIG_LOG_DIR=${ENIQ_LOCAL_LOGS_DIR}/migration
+
+# Migration files
+MIGRATION_CONF=${ENIQ_CONF_DIR}/linux_migration_${HNAME}.conf
+ENIQ_MIGRATION_SCRIPT=${ENIQ_CORE_INST_DIR}/bin/eniq_linux_migration.bsh
+
+# Mount directory
+ENIQ_PORTBACKUP=/eniq/portbackup
+
+# Root ETC directory
+ROOT_ETC=${ENIQ_PORTBACKUP}/${HNAME}/ROOT/etc/
+
+# ENIQ template directory
+ENIQ_INST_TEMPL_DIR=${ENIQ_CORE_INST_DIR}/templates/stats
+
+# Check file with user inputs exists
+if [ ! -s ${USER_CONF} ]; then
+    _err_msg_="Could not find ${USER_CONF}"
+    abort_script "${_err_msg_}" "${EXEC_SHELL_CMD}"
+fi
+
+_temp_user_conf_=${TEM_DIR}/user_conf
+
+}
+
+
+### Function: unpack_inst_eniq_sw ###
+#
+# Unpack/Install ENIQ core installation software
+#
+# Arguments:
+#	none
+# Return Values:
+#	none
+unpack_inst_eniq_sw()
+{
+# Get ENIQ Base SW path from migration.conf file
+ENIQ_BASE_SW_DIR=`$CAT ${MIGRATION_CONF} | $GREP -w MIG_BASE_SW_LOC | $AWK -F"=" '{print $2}'`
+
+_core_inst_sw_bundle_=${ENIQ_BASE_SW_DIR}/${ENIQ_CORE_INST_SW_BUNDLE}
+
+# Check that the bundle exists
+if [ ! -s ${_core_inst_sw_bundle_} ]; then
+     _err_msg_="Failed to find SW bundle\n${_core_inst_sw_bundle_}"
+    abort_script "${_err_msg_}" "${EXEC_SHELL_CMD}"
+fi
+
+cd ${ENIQ_INST_DIR}
+
+$ZCAT ${_core_inst_sw_bundle_} |$GTAR -xf -
+if [ $? -ne 0 ]; then
+    _err_msg_="Failed to install ENIQ Core Install SW...exiting!"
+    abort_script "${_err_msg_}" "${EXEC_SHELL_CMD}"
+else
+    logit "Successfully unpacked ENIQ Core Install SW."
+fi
+}
+
+### Function: update_domain_name ###
+#
+#   update domain name into interface file
+#
+#
+# Arguments:
+#       none
+# Return Values:
+#       none
+update_domain_name()
+{
+# Get domain name from kickstart file
+_domain_name_=`read_value CLIENT_DNSDOMAIN ${ENIQ_CONF_DIR}/${HNAME}/${HNAME}_ks_cfg.txt`|| abort_script "${_domain_name_}" "${EXEC_SHELL_CMD}"
+
+# Get the default interface file
+_intf_file_=`$LS ${INTF_DIR}/*${_pm_int_}* 2> /dev/null`
+
+if [ "${_intf_file_}" ]; then
+    $GREP -i "${_domain_name_}" ${_intf_file_} > /dev/null
+    if [ $? -ne 0 ]; then
+       $ECHO "DOMAIN=\""${_domain_name_}"\"" >> ${_intf_file_}
+    fi
+else
+    _err_msg_="Could not get the default interface file from ${INTF_DIR} directory"
+    abort_script "${_err_msg_}" "${EXEC_SHELL_CMD}"
+fi
+}
+
+### Function: update_merge_config_files ###
+#
+# This function update config file like om_sw_locate, eniq_sw_locate etc. 
+# and merge SunOS.ini file
+#
+# Arguments:none
+#       
+# Return Values
+# none
+#       
+update_merge_config_files()
+{
+insert_header_footer head "Entering stage - ${NEXT_STAGE}" ${LOGFILE}
+
+# Merge user input values to migration conf
+logit "Updating the ${MIGRATION_CONF} file with user inputs given"
+update_migration_conf
+
+logit "Updating and merging config files."
+
+# Updating SunOS.ini file
+logit -q "Updating ${ENIQ_CONF_DIR}/${SUNOS_INI}"
+if [ -s "${ENIQ_INST_TEMPL_DIR}/${SUNOS_INI_TEMPLATE}" ]; then
+    _temp_storage_api_pkg_=`$CAT ${ENIQ_INST_TEMPL_DIR}/${SUNOS_INI_TEMPLATE} | $GREP -w STOR_API_PKG | $AWK -F"=" '{print $2}'`
+    _config_storage_api_pkg_=`$CAT ${ENIQ_CONF_DIR}/${SUNOS_INI} | $GREP -w STOR_API_PKG | $AWK -F"=" '{print $2}'`
+    $SED -i "s/${_config_storage_api_pkg_}/${_temp_storage_api_pkg_}/g" ${ENIQ_CONF_DIR}/${SUNOS_INI} >> /dev/null 2>&1
+    if [ $? -ne 0 ]; then
+        _err_msg_="Could not update ${SUNOS_INI} file."
+        abort_script "${_err_msg_}" "${EXEC_SHELL_CMD}"
+    fi
+else
+    _err_msg_="Could not find ${SUNOS_INI_TEMPLATE} in ${ENIQ_INST_TEMPL_DIR} directory."
+    abort_script "${_err_msg_}" "${EXEC_SHELL_CMD}"
+fi
+
+insert_header_footer foot "Successfully completed stage - ${NEXT_STAGE} " ${LOGFILE}
+
+set_next_stage `$EXPR ${ARRAY_ELEM} + 1`
+}
+
+
+### Function: update_migration_conf ###
+#
+# This function updates migration conf file
+# by merging values from migration_input.conf
+#
+# Arguments:none
+#
+# Return Values
+# none
+#
+update_migration_conf()
+{
+_src_conf_=${USER_CONF}
+_dest_conf_=${MIGRATION_CONF}
+
+# Merge LUN value
+_lun_id_=`read_value MERGED_LUN_ID ${_src_conf_}` || abort_script "${_lun_id_}" "${EXEC_SHELL_CMD}"
+set_conf_value "RECREATED_LUN_ID" "${_lun_id_}" ${_dest_conf_}
+}
+
+
+### Function: user_confirm ###
+#
+# This function will confirm the user input
+#
+# Arguments:none
+#       
+# Return Values:_response_ YES/NO
+#       
+user_confirm()
+{
+
+_usr_msg_=$1
+
+if [ ! "$1" ]; then
+    _usr_msg_="\n\nDo you want to proceed with above values? (Yes/No)"
+fi
+
+unset _response_
+
+while [ 1 ]
+do
+    $ECHO ${_usr_msg_}
+    read ans
+
+    case $ans in
+      Y|y|Yes|yes|yES|YES) _response_="YES"
+                       break
+                       ;;
+      N|n|No|no|nO|NO) _response_="NO"
+                    break
+                    ;;
+      *) $ECHO "Invalid input. Enter again."
+         ;;
+    esac
+done
+}
+
+### Function: validate_ip ###
+#
+# This function will check that an
+# IP address is valid
+#
+# Arguments:
+#       $1 : IP address to be validated
+# Return Values:
+#       0 : Success
+#       1 : Error
+validate_ip()
+{
+_chk_ip_=$1
+_err_flag_=0
+
+if [[ ${_chk_ip_} =~ ^[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}$ ]]; then
+    _orig_ifs_="$IFS"
+    IFS='.'
+
+    _chk_ip_array_=($_chk_ip_)
+    IFS="${_orig_ifs_}"
+
+    _array_length_="${#_chk_ip_array_[@]}"
+    if [ ${_array_length_} -ne 4 ]; then
+        _err_flag_=1
+    fi
+
+    for (( i=0; i<${_array_length_}; i++ )); do
+        if [ ${_chk_ip_array_[$i]} -lt 0 -o ${_chk_ip_array_[$i]} -gt 255 ]; then
+                _err_flag_=1
+        fi
+    done
+else
+    local ipv6=$1
+
+    # The Regex expresion to match IPv6 adresses
+    IPv6_REGEXP='^\s*((([0-9A-Fa-f]{1,4}:){7}([0-9A-Fa-f]{1,4}|:))|(([0-9A-Fa-f]{1,4}:){6}(:[0-9A-Fa-f]{1,4}|((25[0-5]|2[0-4]\d|1\d\d|[1-9]?\d)(\.(25[0-5]|2[0-4]\d|1\d\d|[1-9]?\d)){3})|:))|(([0-9A-Fa-f]{1,4}:){5}(((:[0-9A-Fa-f]{1,4}){1,2})|:((25[0-5]|2[0-4]\d|1\d\d|[1-9]?\d)(\.(25[0-5]|2[0-4]\d|1\d\d|[1-9]?\d)){3})|:))|(([0-9A-Fa-f]{1,4}:){4}(((:[0-9A-Fa-f]{1,4}){1,3})|((:[0-9A-Fa-f]{1,4})?:((25[0-5]|2[0-4]\d|1\d\d|[1-9]?\d)(\.(25[0-5]|2[0-4]\d|1\d\d|[1-9]?\d)){3}))|:))|(([0-9A-Fa-f]{1,4}:){3}(((:[0-9A-Fa-f]{1,4}){1,4})|((:[0-9A-Fa-f]{1,4}){0,2}:((25[0-5]|2[0-4]\d|1\d\d|[1-9]?\d)(\.(25[0-5]|2[0-4]\d|1\d\d|[1-9]?\d)){3}))|:))|(([0-9A-Fa-f]{1,4}:){2}(((:[0-9A-Fa-f]{1,4}){1,5})|((:[0-9A-Fa-f]{1,4}){0,3}:((25[0-5]|2[0-4]\d|1\d\d|[1-9]?\d)(\.(25[0-5]|2[0-4]\d|1\d\d|[1-9]?\d)){3}))|:))|(([0-9A-Fa-f]{1,4}:){1}(((:[0-9A-Fa-f]{1,4}){1,6})|((:[0-9A-Fa-f]{1,4}){0,4}:((25[0-5]|2[0-4]\d|1\d\d|[1-9]?\d)(\.(25[0-5]|2[0-4]\d|1\d\d|[1-9]?\d)){3}))|:))|(:(((:[0-9A-Fa-f]{1,4}){1,7})|((:[0-9A-Fa-f]{1,4}){0,5}:((25[0-5]|2[0-4]\d|1\d\d|[1-9]?\d)(\.(25[0-5]|2[0-4]\d|1\d\d|[1-9]?\d)){3}))|:)))(%.+)?\s*$'
+
+    if [[ "$ipv6" =~ $IPv6_REGEXP ]] ; then
+            # Valid IPv6 address
+            echo "ipv6"
+    else
+        # not valid IPv6 address
+        $ECHO "not valid IP\n"
+        _err_flag_=1
+    fi
+fi
+
+if [ ${_err_flag_} -eq 0 ]; then
+    return 0
+else
+    return 1
+fi
+}
+
+
+
+# ********************************************************************
+#
+# 	Main body of program
+#
+# ********************************************************************
+#
+
+# Command for interactive terminal console.
+${STTY} sane
+export TERM=linux
+
+RUN_TIME=`$DATE '+%Y-%b-%d_%H.%M.%S'`
+
+trap "script_interrupt" INT
+
+check_id $DEFAULT_USER
+
+get_absolute_path
+
+# Create TEM_DIR
+TEM_DIR=/tmp/continue_migration.$$.$$
+$MKDIR -p ${TEM_DIR} 
+
+# Create directory for migration operations
+if [ ! -d ${MIG_DIR} ]; then
+    $MKDIR -p ${MIG_DIR}
+fi
+
+# Logfile name
+LOG_STAMP=`$DATE '+%Y-%b-%d'`
+LOGFILE=${MIG_DIR}/continue_eniq_migration_${LOG_STAMP}.log
+$TOUCH ${LOGFILE} >> /dev/null 2>&1
+
+# Script variables
+SCRIPTPATH=$0
+SCRIPTNAME=`basename $0`
+
+# Set start/resume status
+_status_str_="Starting to run"
+if [ -s ${STAGEFILE} ]; then
+    _status_str_="Resuming"
+fi
+
+insert_header_footer banner "${_status_str_} ${SCRIPTNAME} on $RUN_TIME" ${LOGFILE}
+
+# Copy the script to MIG_DIR directory in case of second run
+if [ ! -f ${MIG_DIR}/$SCRIPTNAME ];then 
+    $CP $SCRIPTPATH ${MIG_DIR} >> /dev/null 2>&1
+    if [ ! -f ${MIG_DIR}/$SCRIPTNAME ];then
+        _err_msg_="Failed to copy $SCRIPTNAME to ${MIG_DIR}."
+        abort_script "${_err_msg_}" "${EXEC_SHELL_CMD}"
+    fi
+fi
+
+# Get required info from user if running for first time
+if [ ! -s ${USER_CONF} ]; then
+    get_user_input
+fi
+
+# Validate if storage password is present in migration conf file 
+# get the input from the user if not present
+get_storage_password
+
+# Setting up all the migration related files and directories
+setup_migration_env
+
+# Get the stage to run
+get_next_stage
+
+# If we read cleanup from the stagefile
+if [ "$NEXT_STAGE" == "cleanup" ]; then
+    # Clean up as it may not be done already
+    $ECHO "\nAll stages of Migration are already completed\n" 
+    exit 0    
+fi
+
+while :; do
+    _nxt_stage_="${NEXT_STAGE}"
+    $_nxt_stage_
+    if [ $? -ne 0 ]; then
+        _err_msg_="Error in Stage ${NEXT_STAGE}"
+        abort_script "$_err_msg_" "${EXEC_SHELL_CMD}"
+    fi
+
+    # If we read cleanup from the stagefile
+    if [ "$NEXT_STAGE" == "cleanup" ]; then
+        break
+    fi
+
+    get_next_stage
+done
+
+# Print completion message
+logit "====================================================="
+logit "-----------------------------------------------------"
+logit "Successfully completed execution of ${SCRIPTNAME}"
+logit "-----------------------------------------------------"
+logit "====================================================="
+
+# Copy the log to eniq location
+if [ -d ${ENIQ_MIG_LOG_DIR} ]; then
+    logit -q "Copying ${LOGFILE} to ${ENIQ_MIG_LOG_DIR} directory"
+    $CP ${LOGFILE} ${ENIQ_MIG_LOG_DIR}/
+fi
+
+exit 0

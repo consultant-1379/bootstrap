@@ -1,0 +1,15 @@
+####################################
+## 			PERMS FILE			  ##
+## element user group permissions ##
+####################################
+
+bin root root 755
+bin/continue_eniq_installation.bsh root root 755
+bin/continue_eniq_migration.bsh root root 755
+bin/continue_eniq_replacement.bsh root root 755
+bin/expansion_automation.bsh root root 755
+
+
+
+version root root 755
+version/pkginfo root root 444
